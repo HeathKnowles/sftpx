@@ -1271,46 +1271,64 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_retries = 100;
+        let max_retries = 1000;
         let mut retry_count = 0;
+        let mut consecutive_no_progress = 0;
         
         while written < data.len() {
-            // Check if stream is writable
-            let is_writable = connection.writable().any(|id| id == stream_id);
+            let before_written = written;
             
-            if is_writable {
-                match connection.stream_send(stream_id, &data[written..], fin && written >= data.len()) {
-                    Ok(w) => {
-                        written += w;
-                        retry_count = 0; // Reset retry count on success
-                    }
-                    Err(ref e) if format!("{:?}", e).contains("Done") => {
-                        // Stream not ready, continue to flush/receive below
-                    }
-                    Err(e) => return Err(e),
+            // Try to write to stream
+            match connection.stream_send(stream_id, &data[written..], fin && written + 1 >= data.len()) {
+                Ok(w) if w > 0 => {
+                    written += w;
+                    retry_count = 0;
+                    consecutive_no_progress = 0;
                 }
+                Ok(_) => {
+                    // 0 bytes written, flow control blocked
+                }
+                Err(ref e) if format!("{:?}", e).contains("Done") => {
+                    // Stream not ready, need to flush
+                }
+                Err(e) => return Err(e),
             }
             
-            // Flush packets
+            // Aggressively flush packets - send everything available
             while let Ok((len, send_info)) = connection.send(out) {
                 socket.send_to(&out[..len], send_info.to)?;
             }
             
-            // Receive ACKs
-            socket.set_read_timeout(Some(Duration::from_millis(10)))?;
-            if let Ok((len, from)) = socket.recv_from(buf) {
-                let recv_info = quiche::RecvInfo { from, to: local_addr };
-                let _ = connection.recv(&mut buf[..len], recv_info);
+            // Receive ACKs to open flow control window - non-blocking
+            socket.set_read_timeout(Some(Duration::from_millis(1)))?;
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo { from, to: local_addr };
+                    let _ = connection.recv(&mut buf[..len], recv_info);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(Error::from(e)),
             }
             
-            if written < data.len() {
+            // Check if we made progress
+            if written == before_written {
+                consecutive_no_progress += 1;
+                
+                // Only sleep if we've had multiple iterations with no progress
+                if consecutive_no_progress > 5 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                
                 retry_count += 1;
                 if retry_count >= max_retries {
                     return Err(Error::Protocol(format!(
-                        "Flow control stall: failed to send after {} retries", max_retries
+                        "Flow control timeout: sent {}/{} bytes after {} retries",
+                        written, data.len(), max_retries
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+            } else {
+                consecutive_no_progress = 0;
             }
         }
         
