@@ -5,10 +5,13 @@ use super::sender::DataSender;
 use crate::protocol::manifest::ManifestBuilder;
 use crate::transport::manifest_stream::ManifestSender;
 use crate::protocol::hash_check::{HashCheckRequestReceiver, HashCheckResponseSender};
+use crate::protocol::resume::{ResumeRequestReceiver, ResumeResponseSender};
+use crate::chunking::ChunkBitmap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_CHUNK_SIZE: usize = 8192;
 const STREAM_HASH_CHECK: u64 = 16;  // Client-initiated bidirectional stream for hash checks (changed from 1)
+const STREAM_RESUME: u64 = 20;      // Client-initiated bidirectional stream for resume protocol
 
 /// Manages file transfers to clients
 pub struct TransferManager {
@@ -206,7 +209,7 @@ impl TransferManager {
     ) -> Result<(PathBuf, u64), Box<dyn std::error::Error>> {
         use crate::transport::manifest_stream::ManifestReceiver;
         use crate::client::receiver::FileReceiver;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
         
         log::info!("TransferManager: starting integrated file receive");
         
@@ -258,6 +261,88 @@ impl TransferManager {
         
         log::info!("Manifest received: {} chunks, {} bytes", 
             manifest.total_chunks, manifest.file_size);
+        
+        // --- RESUME PROTOCOL PHASE ---
+        // Check if client wants to resume a partial transfer
+        log::info!("Server: checking for resume request on stream {}...", STREAM_RESUME);
+        
+        let mut chunk_bitmap = ChunkBitmap::with_exact_size(manifest.total_chunks as u32);
+        let bitmap_path = output_dir.join(format!(".{}.bitmap", manifest.session_id));
+        let mut resume_mode = false;
+        let mut skip_chunks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        
+        // Wait briefly for resume request
+        let mut resume_request_receiver = ResumeRequestReceiver::new();
+        let mut resume_iterations = 0;
+        const MAX_RESUME_WAIT: usize = 50;  // 50 * 10ms = 500ms
+        
+        while resume_iterations < MAX_RESUME_WAIT {
+            // Process network I/O
+            socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+            if let Ok((len, from)) = socket.recv_from(&mut buf) {
+                let _ = connection.process_packet(&mut buf[..len], from, socket.local_addr()?);
+            }
+            let _ = connection.send_packets(socket, &mut out);
+            
+            // Check if resume stream is readable
+            let readable_streams: Vec<u64> = connection.readable().collect();
+            if readable_streams.contains(&STREAM_RESUME) {
+                match connection.stream_recv(STREAM_RESUME, &mut buf) {
+                    Ok((read, fin)) => {
+                        if read > 0 {
+                            if let Ok(Some(request)) = resume_request_receiver.receive_chunk(&buf[..read], fin) {
+                                log::info!("Server: received resume request with {} received chunks", request.received_chunks.len());
+                                resume_mode = true;
+                                
+                                // Reconstruct bitmap from received chunks
+                                for &chunk_idx in &request.received_chunks {
+                                    if chunk_idx < manifest.total_chunks {
+                                        chunk_bitmap.mark_received(chunk_idx as u32, chunk_idx == manifest.total_chunks - 1);
+                                        skip_chunks.insert(chunk_idx);
+                                    }
+                                }
+                                
+                                // Find missing chunks
+                                let missing = chunk_bitmap.find_missing();
+                                let missing_u64: Vec<u64> = missing.iter().map(|&x| x as u64).collect();
+                                
+                                log::info!("Server: {} of {} chunks already received, {} missing", 
+                                    request.received_chunks.len(), manifest.total_chunks, missing_u64.len());
+                                
+                                // Send resume response
+                                let resume_response_sender = ResumeResponseSender::new();
+                                resume_response_sender.send_response(
+                                    request.session_id.clone(),
+                                    true,
+                                    missing_u64.clone(),
+                                    missing_u64.len() as u64,
+                                    None,
+                                    |data, fin| connection.stream_send(STREAM_RESUME, data, fin)
+                                )?;
+                                
+                                // Flush response
+                                for _ in 0..10 {
+                                    let _ = connection.send_packets(socket, &mut out);
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                
+                                log::info!("Server: resume response sent");
+                                break;
+                            }
+                        }
+                    }
+                    Err(quiche::Error::Done) => {}
+                    Err(e) => log::debug!("Server: resume stream error: {:?}", e),
+                }
+            }
+            
+            resume_iterations += 1;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        
+        if !resume_mode {
+            log::info!("Server: no resume request received, starting fresh transfer");
+        }
         
         // --- HASH CHECK PHASE (Deduplication) ---
         log::info!("Server: waiting for hash check request on stream {} (client-initiated)...", STREAM_HASH_CHECK);
@@ -472,6 +557,18 @@ impl TransferManager {
                                 match receiver.receive_chunk(&chunk_data) {
                                     Ok(_chunk) => {
                                         chunks_received += 1;
+                                        
+                                        // Update bitmap with received chunk
+                                        let is_last = chunks_received == manifest.total_chunks;
+                                        chunk_bitmap.mark_received((chunks_received - 1) as u32, is_last);
+                                        
+                                        // Periodically save bitmap for resume
+                                        if chunks_received % 10 == 0 || is_last {
+                                            if let Err(e) = chunk_bitmap.save_to_disk(&bitmap_path) {
+                                                log::warn!("Server: failed to save bitmap: {:?}", e);
+                                            }
+                                        }
+                                        
                                         let progress = receiver.progress();
                                         if chunks_received % 5 == 0 || progress - last_progress > 0.1 {
                                             log::info!("Server: received chunk {}/{} ({:.1}%)", 
@@ -566,9 +663,19 @@ impl TransferManager {
                 chunk_index.total_chunks());
         }
         
+        // Delete bitmap file after successful transfer
+        if bitmap_path.exists() {
+            if let Err(e) = std::fs::remove_file(&bitmap_path) {
+                log::warn!("Server: failed to delete bitmap file: {:?}", e);
+            } else {
+                log::debug!("Server: deleted bitmap file");
+            }
+        }
+        
         log::info!("TransferManager: file receive complete!");
         log::info!("  File saved to: {:?}", final_path);
         log::info!("  Total bytes: {}", bytes_received);
+        log::info!("  Resume mode: {}", resume_mode);
         
         Ok((final_path, bytes_received))
     }

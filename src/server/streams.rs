@@ -2,7 +2,7 @@
 
 use super::connection::ServerConnection;
 
-const NUM_STREAMS: usize = 6;
+const NUM_STREAMS: usize = 7;
 
 /// Types of streams in the server
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +12,7 @@ pub enum StreamType {
     Data,         // Client-initiated (ID 8)
     Status,       // Client-initiated (ID 12)
     HashCheck,    // Client-initiated (ID 16) - changed from server-initiated
+    Resume,       // Client-initiated (ID 20)
     Delta,        // Server-initiated (ID 5)
 }
 
@@ -24,6 +25,7 @@ impl StreamType {
             StreamType::Data => 8,         // Client-initiated
             StreamType::Status => 12,      // Client-initiated
             StreamType::HashCheck => 16,   // Client-initiated (changed from 1)
+            StreamType::Resume => 20,      // Client-initiated
             StreamType::Delta => 5,        // Server-initiated
         }
     }
@@ -36,6 +38,7 @@ impl StreamType {
             StreamType::Data,
             StreamType::Status,
             StreamType::HashCheck,
+            StreamType::Resume,
             StreamType::Delta,
         ]
     }

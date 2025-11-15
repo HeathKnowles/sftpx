@@ -16,6 +16,10 @@ pub use hash_check::{
     HashCheckRequestSender, HashCheckRequestReceiver,
     HashCheckResponseSender, HashCheckResponseReceiver,
 };
+pub use resume::{
+    ResumeRequestSender, ResumeRequestReceiver,
+    ResumeResponseSender, ResumeResponseReceiver,
+};
 pub use messages::{
     SessionStart, Manifest, ChunkPacket, ResumeRequest, ResumeResponse,
     StatusUpdate, TransferComplete, TransferState, HashCheckRequest, HashCheckResponse,

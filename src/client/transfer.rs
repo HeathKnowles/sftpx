@@ -12,8 +12,10 @@ use crate::transport::manifest_stream::ManifestReceiver;
 use crate::protocol::control::ControlMessage;
 use crate::client::receiver::FileReceiver;
 use super::connection::ClientConnection;
-use super::streams::{StreamManager, STREAM_CONTROL, STREAM_HASH_CHECK, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS};
+use super::streams::{StreamManager, STREAM_CONTROL, STREAM_HASH_CHECK, STREAM_RESUME, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS};
 use crate::protocol::hash_check::{HashCheckRequestSender, HashCheckResponseReceiver};
+use crate::protocol::resume::{ResumeRequestSender, ResumeResponseReceiver};
+use crate::chunking::ChunkBitmap;
 use super::session::ClientSession;
 
 pub struct Transfer {
@@ -368,6 +370,16 @@ impl Transfer {
             file_path,
         )?;
         
+        // --- RESUME PROTOCOL PHASE (check if server has partial file) ---
+        let skip_chunks = self.check_resume_phase(
+            &socket,
+            &mut connection,
+            &mut buf,
+            &mut out,
+            local_addr,
+            &manifest,
+        )?;
+        
         // --- FILE SEND PHASE ---
         let chunks_bytes = self.send_file_phase(
             &socket,
@@ -378,6 +390,7 @@ impl Transfer {
             file_path,
             &manifest,
             &existing_hashes,
+            &skip_chunks,
         )?;
         
         // Clean close
@@ -725,6 +738,187 @@ impl Transfer {
         Ok((total_sent as u64, manifest, existing_hashes))
     }
     
+    /// Resume protocol phase - check if server has partial file
+    fn check_resume_phase(
+        &mut self,
+        socket: &UdpSocket,
+        connection: &mut ClientConnection,
+        buf: &mut [u8],
+        out: &mut [u8],
+        local_addr: std::net::SocketAddr,
+        manifest: &crate::protocol::messages::Manifest,
+    ) -> Result<std::collections::HashSet<u64>> {
+        use std::collections::HashSet;
+        
+        // Check if we have a saved bitmap from a previous interrupted transfer
+        let bitmap_path = self.get_resume_bitmap_path(&manifest.session_id);
+        
+        if !bitmap_path.exists() {
+            info!("Client: no saved bitmap found, starting fresh transfer");
+            return Ok(HashSet::new());
+        }
+        
+        info!("Client: found saved bitmap, attempting resume...");
+        
+        // Load bitmap from disk
+        let bitmap = match ChunkBitmap::load_from_disk(&bitmap_path) {
+            Ok(bm) => {
+                info!("Client: loaded bitmap with {} chunks received", bm.received_count());
+                bm
+            }
+            Err(e) => {
+                warn!("Client: failed to load bitmap: {}, starting fresh", e);
+                return Ok(HashSet::new());
+            }
+        };
+        
+        // Don't resume if no progress was made
+        if bitmap.received_count() == 0 {
+            info!("Client: bitmap shows no progress, starting fresh");
+            std::fs::remove_file(&bitmap_path).ok();
+            return Ok(HashSet::new());
+        }
+        
+        // Send resume request to server
+        let resume_request_sender = ResumeRequestSender::new();
+        let received_chunks = bitmap.get_received_chunks();
+        let last_chunk = received_chunks.last().copied();
+        
+        info!("Client: sending resume request for {} received chunks", received_chunks.len());
+        
+        let send_result = resume_request_sender.send_request(
+            manifest.session_id.clone(),
+            received_chunks.clone(),
+            Some(bitmap.to_bytes()),
+            last_chunk,
+            |data: &[u8], fin: bool| -> std::result::Result<usize, quiche::Error> {
+                match connection.stream_send(STREAM_RESUME, data, fin) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(quiche::Error::Done), // Map to quiche error
+                }
+            }
+        );
+        
+        if let Err(e) = send_result {
+            warn!("Client: failed to send resume request: {}, starting fresh", e);
+            std::fs::remove_file(&bitmap_path).ok();
+            return Ok(HashSet::new());
+        }
+        
+        // Flush the request
+        socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+        for _ in 0..20 {
+            loop {
+                match connection.send(out) {
+                    Ok((write, send_info)) => {
+                        if write > 0 {
+                            socket.send_to(&out[..write], send_info.to)?;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            
+            // Receive ACKs
+            if let Ok((len, from)) = socket.recv_from(buf) {
+                let recv_info = quiche::RecvInfo { from, to: local_addr };
+                let _ = connection.recv(&mut buf[..len], recv_info);
+            }
+            
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        
+        info!("Client: resume request sent, waiting for response...");
+        
+        // Receive resume response
+        let mut response_receiver = ResumeResponseReceiver::new();
+        let mut received_response = false;
+        let mut skip_chunks = HashSet::new();
+        let mut idle_iterations = 0;
+        const MAX_IDLE: usize = 200; // 200 * 10ms = 2 seconds
+        
+        while !received_response && idle_iterations < MAX_IDLE {
+            // Flush outgoing packets
+            while let Ok((write, send_info)) = connection.send(out) {
+                socket.send_to(&out[..write], send_info.to)?;
+                idle_iterations = 0;
+            }
+            
+            // Receive data
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo { from, to: local_addr };
+                    let _ = connection.recv(&mut buf[..len], recv_info);
+                    idle_iterations = 0;
+                    
+                    // Check for resume response on STREAM_RESUME
+                    while let Ok((read, fin)) = connection.stream_recv(STREAM_RESUME, buf) {
+                        if read > 0 {
+                            if let Some(response) = response_receiver.receive_chunk(&buf[..read], fin)? {
+                                if response.accepted {
+                                    info!("Client: resume accepted! Server needs {} chunks", response.chunks_remaining);
+                                    
+                                    // Build skip set - chunks NOT in missing list
+                                    let missing_set: HashSet<u64> = response.missing_chunks.iter().copied().collect();
+                                    for chunk_idx in 0..manifest.total_chunks {
+                                        if !missing_set.contains(&chunk_idx) {
+                                            skip_chunks.insert(chunk_idx);
+                                        }
+                                    }
+                                    
+                                    info!("Client: will skip {} chunks, send {} chunks", 
+                                        skip_chunks.len(), response.missing_chunks.len());
+                                } else {
+                                    warn!("Client: resume rejected by server: {:?}", response.error);
+                                    std::fs::remove_file(&bitmap_path).ok();
+                                }
+                                received_response = true;
+                                break;
+                            }
+                        }
+                        if fin {
+                            break;
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock ||
+                              e.kind() == std::io::ErrorKind::TimedOut => {
+                    idle_iterations += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(Error::from(e)),
+            }
+            
+            if connection.is_closed() {
+                warn!("Client: connection closed during resume");
+                return Err(Error::ConnectionClosed);
+            }
+        }
+        
+        if !received_response {
+            warn!("Client: no resume response received, starting fresh");
+            std::fs::remove_file(&bitmap_path).ok();
+            return Ok(HashSet::new());
+        }
+        
+        Ok(skip_chunks)
+    }
+    
+    /// Get the path to the resume bitmap file for a session
+    fn get_resume_bitmap_path(&self, session_id: &str) -> PathBuf {
+        PathBuf::from(&self.config.session_dir)
+            .join(format!("{}.bitmap", session_id))
+    }
+    
+    /// Save bitmap for resume capability
+    fn save_resume_bitmap(&self, session_id: &str, bitmap: &ChunkBitmap) -> Result<()> {
+        let path = self.get_resume_bitmap_path(session_id);
+        bitmap.save_to_disk(&path)
+            .map_err(|e| Error::Io(e))?;
+        debug!("Client: saved resume bitmap to {:?}", path);
+        Ok(())
+    }
+    
     /// Hash check phase - check which chunks already exist on server
     fn hash_check_phase(
         &mut self,
@@ -897,6 +1091,7 @@ impl Transfer {
         file_path: &Path,
         manifest: &crate::protocol::messages::Manifest,
         existing_hashes: &[Vec<u8>],
+        skip_chunks: &std::collections::HashSet<u64>,
     ) -> Result<u64> {
         use crate::chunking::FileChunker;
         use std::collections::HashSet;
@@ -922,13 +1117,38 @@ impl Transfer {
             total_chunks, chunker.file_size(), self.config.compression);
         
         if !existing_set.is_empty() {
-            info!("Client: {} chunks already exist on server (will skip)", existing_set.len());
+            info!("Client: {} chunks already exist on server (will skip via dedup)", existing_set.len());
+        }
+        
+        if !skip_chunks.is_empty() {
+            info!("Client: {} chunks already received by server (will skip via resume)", skip_chunks.len());
+        }
+        
+        // Create bitmap for tracking sent chunks (for resume capability)
+        let mut sent_bitmap = ChunkBitmap::with_exact_size(total_chunks as u32);
+        
+        // Mark skipped chunks as already sent
+        for &chunk_idx in skip_chunks {
+            if chunk_idx < total_chunks {
+                sent_bitmap.mark_received(chunk_idx as u32, chunk_idx == total_chunks - 1);
+            }
         }
         
         while let Some(chunk_packet) = chunker.next_chunk()? {
             let is_last = chunk_count == total_chunks - 1;
             
-            // Check if this chunk's hash exists on server
+            // Check if this chunk should be skipped (resume mode)
+            if skip_chunks.contains(&chunk_count) {
+                chunks_skipped += 1;
+                chunk_count += 1;
+                
+                if chunk_count % 10 == 0 {
+                    info!("Client: skipped chunk {}/{} (resume)", chunk_count, total_chunks);
+                }
+                continue;
+            }
+            
+            // Check if this chunk's hash exists on server (dedup)
             let chunk_hash = &manifest.chunk_hashes[chunk_count as usize];
             let should_skip = existing_set.contains(chunk_hash.as_slice());
             
@@ -957,6 +1177,17 @@ impl Transfer {
             
             bytes_sent += chunk_packet.len() as u64;
             chunk_count += 1;
+            
+            // Mark chunk as sent in bitmap for resume capability
+            let is_eof_chunk = chunk_count == total_chunks;
+            sent_bitmap.mark_received((chunk_count - 1) as u32, is_eof_chunk);
+            
+            // Periodically save bitmap for resume
+            if chunk_count % 10 == 0 || is_eof_chunk {
+                if let Err(e) = self.save_resume_bitmap(&manifest.session_id, &sent_bitmap) {
+                    warn!("Client: failed to save resume bitmap: {}", e);
+                }
+            }
             
             if chunk_count % 5 == 0 || is_last {
                 info!("Client: sent chunk {}/{} ({:.1}%)", 
@@ -1005,6 +1236,17 @@ impl Transfer {
         }
         
         info!("Client: file upload complete ({} bytes sent)", bytes_sent);
+        
+        // Delete bitmap file after successful transfer
+        let bitmap_path = self.get_resume_bitmap_path(&manifest.session_id);
+        if bitmap_path.exists() {
+            if let Err(e) = std::fs::remove_file(&bitmap_path) {
+                warn!("Client: failed to delete bitmap file: {}", e);
+            } else {
+                debug!("Client: deleted resume bitmap file");
+            }
+        }
+        
         Ok(bytes_sent)
     }
     

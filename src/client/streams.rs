@@ -14,6 +14,7 @@ pub const STREAM_MANIFEST: u64 = 4;    // Client-initiated bidirectional - File 
 pub const STREAM_DATA: u64 = 8;        // Client-initiated bidirectional - File data chunks
 pub const STREAM_STATUS: u64 = 12;     // Client-initiated bidirectional - Transfer status updates
 pub const STREAM_HASH_CHECK: u64 = 16; // Client-initiated bidirectional - Hash check requests/responses (changed from 1)
+pub const STREAM_RESUME: u64 = 20;     // Client-initiated bidirectional - Resume requests/responses
 pub const STREAM_DELTA: u64 = 5;       // Server-initiated bidirectional - Delta sync requests/patches
 
 pub struct StreamManager {

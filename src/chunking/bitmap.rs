@@ -1,5 +1,9 @@
 // Bitmap for tracking received chunks
 
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+
 /// Efficient bitmap for tracking which chunks have been received.
 /// Uses bit-level operations for minimal memory overhead.
 /// 
@@ -280,6 +284,80 @@ impl ChunkBitmap {
     pub fn has_eof(&self) -> bool {
         self.have_eof
     }
+    
+    /// Save bitmap to disk for resumability
+    /// 
+    /// Format: [total_chunks: u32][received_count: u32][have_eof: u8][capacity: u32][bitmap_data: bytes]
+    pub fn save_to_disk<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        
+        // Write header
+        file.write_all(&self.total_chunks.unwrap_or(0).to_le_bytes())?;
+        file.write_all(&self.received_count.to_le_bytes())?;
+        file.write_all(&[if self.have_eof { 1 } else { 0 }])?;
+        file.write_all(&self.capacity.to_le_bytes())?;
+        
+        // Write bitmap data
+        file.write_all(&self.bitmap)?;
+        
+        file.sync_all()?;
+        Ok(())
+    }
+    
+    /// Load bitmap from disk for resume
+    pub fn load_from_disk<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        let mut file = File::open(path)?;
+        
+        // Read header
+        let mut total_chunks_bytes = [0u8; 4];
+        file.read_exact(&mut total_chunks_bytes)?;
+        let total_chunks_val = u32::from_le_bytes(total_chunks_bytes);
+        let total_chunks = if total_chunks_val > 0 { Some(total_chunks_val) } else { None };
+        
+        let mut received_count_bytes = [0u8; 4];
+        file.read_exact(&mut received_count_bytes)?;
+        let received_count = u32::from_le_bytes(received_count_bytes);
+        
+        let mut have_eof_byte = [0u8; 1];
+        file.read_exact(&mut have_eof_byte)?;
+        let have_eof = have_eof_byte[0] != 0;
+        
+        let mut capacity_bytes = [0u8; 4];
+        file.read_exact(&mut capacity_bytes)?;
+        let capacity = u32::from_le_bytes(capacity_bytes);
+        
+        // Read bitmap data
+        let mut bitmap = Vec::new();
+        file.read_to_end(&mut bitmap)?;
+        
+        Ok(Self {
+            bitmap,
+            total_chunks,
+            received_count,
+            have_eof,
+            capacity,
+        })
+    }
+    
+    /// Get raw bitmap bytes for transmission in ResumeRequest
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.bitmap.clone()
+    }
+    
+    /// Get list of received chunk indices for ResumeRequest
+    pub fn get_received_chunks(&self) -> Vec<u64> {
+        let mut received = Vec::new();
+        
+        if let Some(total) = self.total_chunks {
+            for chunk_num in 0..total {
+                if self.is_received(chunk_num) {
+                    received.push(chunk_num as u64);
+                }
+            }
+        }
+        
+        received
+    }
 }
 
 impl Default for ChunkBitmap {
@@ -422,5 +500,48 @@ mod tests {
         assert_eq!(bitmap.received_count(), 0);
         assert!(!bitmap.has_eof());
         assert!(!bitmap.is_received(0));
+    }
+    
+    #[test]
+    fn test_save_and_load() {
+        use std::env::temp_dir;
+        
+        let mut bitmap = ChunkBitmap::new(10);
+        bitmap.mark_received(0, false);
+        bitmap.mark_received(2, false);
+        bitmap.mark_received(4, true);  // EOF at chunk 4, so total = 5
+        
+        assert_eq!(bitmap.received_count(), 3);
+        assert_eq!(bitmap.total_chunks(), Some(5));
+        
+        // Save to temp file
+        let path = temp_dir().join("test_bitmap.bin");
+        bitmap.save_to_disk(&path).expect("Failed to save bitmap");
+        
+        // Load from temp file
+        let loaded = ChunkBitmap::load_from_disk(&path).expect("Failed to load bitmap");
+        
+        assert_eq!(loaded.received_count(), 3);
+        assert_eq!(loaded.total_chunks(), Some(5));
+        assert!(loaded.is_received(0));
+        assert!(!loaded.is_received(1));
+        assert!(loaded.is_received(2));
+        assert!(!loaded.is_received(3));
+        assert!(loaded.is_received(4));
+        assert!(loaded.has_eof());
+        
+        // Cleanup
+        std::fs::remove_file(path).ok();
+    }
+    
+    #[test]
+    fn test_get_received_chunks() {
+        let mut bitmap = ChunkBitmap::new(10);
+        bitmap.mark_received(0, false);
+        bitmap.mark_received(2, false);
+        bitmap.mark_received(4, true);  // total = 5
+        
+        let received = bitmap.get_received_chunks();
+        assert_eq!(received, vec![0, 2, 4]);
     }
 }
