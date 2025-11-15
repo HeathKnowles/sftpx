@@ -310,45 +310,49 @@ impl TransferManager {
                 }
             }
             
-            // Check for hash check request on STREAM_HASH_CHECK
-            loop {
-                match connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
-                    Ok((read, fin)) => {
-                        if read > 0 {
-                            total_bytes_received += read;
-                            log::debug!("Server: read {} bytes from hash check stream (total: {}, fin: {})", read, total_bytes_received, fin);
-                            made_progress = true;
-                            
-                            match hash_request_receiver.receive_chunk(&buf[..read], fin) {
-                                Ok(Some(request)) => {
-                                    chunk_hashes_to_check = request.chunk_hashes;
-                                    hash_request_received = true;
-                                    log::info!("Server: received hash check request with {} hashes ({} bytes)", chunk_hashes_to_check.len(), total_bytes_received);
-                                    break;
-                                }
-                                Ok(None) => {
-                                    // Need more data, continue reading
-                                    log::debug!("Server: hash check incomplete, need more data");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    log::error!("Server: hash check parse error: {:?}", e);
-                                    break;
+            // Only try to read from stream 16 if it's actually readable
+            let readable_streams: Vec<u64> = connection.readable().collect();
+            if readable_streams.contains(&STREAM_HASH_CHECK) {
+                // Check for hash check request on STREAM_HASH_CHECK
+                loop {
+                    match connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
+                        Ok((read, fin)) => {
+                            if read > 0 {
+                                total_bytes_received += read;
+                                log::debug!("Server: read {} bytes from hash check stream (total: {}, fin: {})", read, total_bytes_received, fin);
+                                made_progress = true;
+                                
+                                match hash_request_receiver.receive_chunk(&buf[..read], fin) {
+                                    Ok(Some(request)) => {
+                                        chunk_hashes_to_check = request.chunk_hashes;
+                                        hash_request_received = true;
+                                        log::info!("Server: received hash check request with {} hashes ({} bytes)", chunk_hashes_to_check.len(), total_bytes_received);
+                                        break;
+                                    }
+                                    Ok(None) => {
+                                        // Need more data, continue reading
+                                        log::debug!("Server: hash check incomplete, need more data");
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        log::error!("Server: hash check parse error: {:?}", e);
+                                        break;
+                                    }
                                 }
                             }
+                            if fin {
+                                log::debug!("Server: hash check stream closed (fin received)");
+                                break;
+                            }
+                            if read == 0 {
+                                break;
+                            }
                         }
-                        if fin {
-                            log::debug!("Server: hash check stream closed (fin received)");
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            log::debug!("Server: stream_recv error on stream {}: {:?}", STREAM_HASH_CHECK, e);
                             break;
                         }
-                        if read == 0 {
-                            break;
-                        }
-                    }
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        log::warn!("Server: stream_recv error: {:?}", e);
-                        break;
                     }
                 }
             }
