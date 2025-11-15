@@ -276,19 +276,23 @@ impl TransferManager {
         let mut hash_request_received = false;
         let mut chunk_hashes_to_check = vec![];
         let mut idle_iterations = 0;
+        let mut total_bytes_received = 0;
         const MAX_IDLE: usize = 500;  // Increased timeout: 500 * 10ms = 5 seconds
         
         socket.set_read_timeout(Some(Duration::from_millis(10)))?;
         
         while !hash_request_received && idle_iterations < MAX_IDLE {
+            let mut made_progress = false;
+            
             // Process network I/O to receive hash check request
             match socket.recv_from(&mut buf) {
                 Ok((len, from)) => {
+                    log::debug!("Server: received {} bytes from {}", len, from);
                     let _ = connection.process_packet(&mut buf[..len], from, socket.local_addr()?);
-                    idle_iterations = 0;
+                    made_progress = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                    idle_iterations += 1;
+                    // No data available
                 }
                 Err(e) => {
                     log::warn!("Server: socket recv error during hash check: {:?}", e);
@@ -298,23 +302,66 @@ impl TransferManager {
             // Send any response packets
             let _ = connection.send_packets(socket, &mut out);
             
+            // Log readable streams for debugging
+            if idle_iterations % 100 == 0 {
+                let readable_streams: Vec<u64> = connection.readable().collect();
+                if !readable_streams.is_empty() {
+                    log::debug!("Server: readable streams: {:?}", readable_streams);
+                }
+            }
+            
             // Check for hash check request on STREAM_HASH_CHECK
-            while let Ok((read, fin)) = connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
-                if read > 0 {
-                    if let Some(request) = hash_request_receiver.receive_chunk(&buf[..read], fin)? {
-                        chunk_hashes_to_check = request.chunk_hashes;
-                        hash_request_received = true;
-                        log::info!("Server: received hash check request with {} hashes", chunk_hashes_to_check.len());
+            loop {
+                match connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
+                    Ok((read, fin)) => {
+                        if read > 0 {
+                            total_bytes_received += read;
+                            log::debug!("Server: read {} bytes from hash check stream (total: {}, fin: {})", read, total_bytes_received, fin);
+                            made_progress = true;
+                            
+                            match hash_request_receiver.receive_chunk(&buf[..read], fin) {
+                                Ok(Some(request)) => {
+                                    chunk_hashes_to_check = request.chunk_hashes;
+                                    hash_request_received = true;
+                                    log::info!("Server: received hash check request with {} hashes ({} bytes)", chunk_hashes_to_check.len(), total_bytes_received);
+                                    break;
+                                }
+                                Ok(None) => {
+                                    // Need more data, continue reading
+                                    log::debug!("Server: hash check incomplete, need more data");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    log::error!("Server: hash check parse error: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        if fin {
+                            log::debug!("Server: hash check stream closed (fin received)");
+                            break;
+                        }
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => {
+                        log::warn!("Server: stream_recv error: {:?}", e);
                         break;
                     }
-                }
-                if fin {
-                    break;
                 }
             }
             
             if hash_request_received {
                 break;
+            }
+            
+            // Only increment idle counter if we didn't make any progress
+            if !made_progress {
+                idle_iterations += 1;
+            } else {
+                idle_iterations = 0;  // Reset on progress
             }
             
             if connection.is_closed() {
@@ -342,16 +389,27 @@ impl TransferManager {
         if hash_request_received {
             let hash_response_sender = HashCheckResponseSender::new();
             
+            log::info!("Server: sending hash check response with {} existing hashes", existing_hashes.len());
+            
             hash_response_sender.send_response(
                 manifest.session_id.clone(),
                 existing_hashes.clone(),
                 |data, fin| {
+                    log::debug!("Server: writing {} bytes to hash check stream (fin={})", data.len(), fin);
                     connection.stream_send(STREAM_HASH_CHECK, data, fin)
                         .map_err(|e| crate::common::error::Error::Protocol(format!("Failed to send hash check response: {:?}", e)))
                 }
             )?;
             
-            log::info!("Server: sent hash check response");
+            // Flush the response
+            for _ in 0..20 {
+                if let Err(e) = connection.send_packets(socket, &mut out) {
+                    log::warn!("Server: error flushing hash check response: {:?}", e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            
+            log::info!("Server: hash check response sent and flushed");
         }
         
         // --- FILE RECEIVE PHASE ---

@@ -736,24 +736,73 @@ impl Transfer {
         session_id: &str,
         chunk_hashes: Vec<Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>> {
+        info!("Client: starting hash check phase for {} chunk hashes", chunk_hashes.len());
+        
         // Send hash check request on client-initiated stream (STREAM_HASH_CHECK = 16)
         // Client opens the stream and both parties can read/write
         let hash_sender = HashCheckRequestSender::new();
         
-        let send_result = hash_sender.send_request(
-            session_id.to_string(),
-            chunk_hashes.clone(),
-            |data, fin| {
-                connection.stream_send(STREAM_HASH_CHECK, data, fin)
-            },
-        )?;
+        // Retry sending if stream isn't ready
+        let mut send_attempts = 0;
+        let send_result = loop {
+            match hash_sender.send_request(
+                session_id.to_string(),
+                chunk_hashes.clone(),
+                |data, fin| {
+                    debug!("Client: attempt {} - writing {} bytes to hash check stream (fin={})", send_attempts + 1, data.len(), fin);
+                    connection.stream_send(STREAM_HASH_CHECK, data, fin)
+                },
+            ) {
+                Ok(result) => break result,
+                Err(e) => {
+                    send_attempts += 1;
+                    if send_attempts >= 3 {
+                        warn!("Client: failed to send hash check request after {} attempts: {}", send_attempts, e);
+                        return Ok(vec![]); // Continue without dedup
+                    }
+                    warn!("Client: hash check send attempt {} failed: {}, retrying...", send_attempts, e);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
         
-        debug!("Hash check request sent: {} bytes", send_result);
+        info!("Client: hash check request prepared: {} bytes", send_result);
         
-        // Flush outgoing packets
-        while let Ok((write, send_info)) = connection.send(out) {
-            socket.send_to(&out[..write], send_info.to)?;
+        // Actively flush and receive to ensure request is sent and ACKed
+        let mut flush_iterations = 0;
+        while flush_iterations < 50 {
+            // Send outgoing packets
+            let mut sent_any = false;
+            while let Ok((write, send_info)) = connection.send(out) {
+                socket.send_to(&out[..write], send_info.to)?;
+                sent_any = true;
+                debug!("Client: sent {} bytes during hash check flush", write);
+            }
+            
+            // Receive to process ACKs
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo {
+                        to: local_addr,
+                        from,
+                    };
+                    let _ = connection.recv(&mut buf[..len], recv_info);
+                    debug!("Client: received {} bytes during hash check flush", len);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => warn!("Client: recv error during hash check flush: {}", e),
+            }
+            
+            if !sent_any {
+                flush_iterations += 1;
+            } else {
+                flush_iterations = 0;
+            }
+            
+            std::thread::sleep(Duration::from_millis(10));
         }
+        
+        info!("Client: hash check request sent, waiting for response...");
         
         // Receive hash check response on same stream
         let mut response_receiver = HashCheckResponseReceiver::new();
