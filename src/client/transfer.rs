@@ -768,6 +768,9 @@ impl Transfer {
         
         info!("Client: hash check request prepared: {} bytes", send_result);
         
+        // Set short read timeout for non-blocking receive during flush
+        socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+        
         // Actively flush and receive to ensure ALL data is sent
         // The stream_send call buffers data, we need to send packets until buffer is empty
         let mut consecutive_no_send = 0;
@@ -805,9 +808,9 @@ impl Transfer {
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}  // Expected with short timeout
                 Err(e) => {
-                    // Don't warn on every timeout, just debug
-                    debug!("Client: recv error during hash check flush: {}", e);
+                    warn!("Client: unexpected recv error during hash check flush: {}", e);
                 }
             }
             
