@@ -1,6 +1,3 @@
-// Example: Test QUIC Server
-// Run with: cargo run --example test_server
-
 use sftpx::server::{Server, ServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

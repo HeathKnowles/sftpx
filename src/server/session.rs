@@ -60,13 +60,34 @@ impl<'a> ServerSession<'a> {
         buf: &mut [u8],
         out: &mut [u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        while !self.connection.is_established() {
-            if let Ok((len, from)) = socket.recv_from(buf) {
-                let to = socket.local_addr()?;
-                self.connection.process_packet(&mut buf[..len], from, to)?;
-                self.connection.send_packets(socket, out)?;
+        socket.set_nonblocking(true)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        
+        println!("Server: completing handshake...");
+        while !self.connection.is_established() && Instant::now() < deadline {
+            // Try to receive packets
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    println!("Server: handshake recv {} bytes", len);
+                    let to = socket.local_addr()?;
+                    self.connection.process_packet(&mut buf[..len], from, to)?;
+                    self.connection.send_packets(socket, out)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, send any pending packets
+                    self.connection.send_packets(socket, out)?;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
             }
         }
+        
+        if self.connection.is_established() {
+            println!("Server: handshake complete!");
+        } else {
+            return Err("Handshake timeout".into());
+        }
+        
         Ok(())
     }
 

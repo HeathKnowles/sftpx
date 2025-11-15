@@ -58,12 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Complete handshake
     println!("\nCompleting handshake...");
-    loop {
-        if conn.is_established() {
-            println!("✓ Connection established!\n");
-            break;
-        }
-        
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    
+    let handshake_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !conn.is_established() && std::time::Instant::now() < handshake_deadline {
         // Receive packets
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
@@ -72,7 +70,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     from,
                     to: local_addr,
                 };
-                conn.recv(&mut buf[..len], recv_info)?;
+                match conn.recv(&mut buf[..len], recv_info) {
+                    Ok(_) => {},
+                    Err(e) => eprintln!("  - conn.recv error: {:?}", e),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                      e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout is normal, continue
             }
             Err(e) => {
                 eprintln!("Socket recv error: {:?}", e);
@@ -84,6 +89,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok((write, send_info)) = conn.send(&mut out) {
             socket.send_to(&out[..write], send_info.to)?;
         }
+        
+        if conn.is_established() {
+            println!("✓ Connection established!\n");
+            break;
+        }
+        
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    
+    if !conn.is_established() {
+        return Err("Handshake timeout".into());
     }
     
     // Send application data on stream 0

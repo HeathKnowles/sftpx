@@ -84,7 +84,9 @@ impl Server {
         let mut out = [0u8; MAX_DATAGRAM_SIZE];
 
         loop {
+            println!("Server: waiting for initial packet...");
             let (len, from) = self.socket.recv_from(&mut buf)?;
+            println!("Server: received initial packet ({} bytes) from {}", len, from);
 
             let mut hdr_buf = &mut buf[..len];
             let hdr = match quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
@@ -103,14 +105,17 @@ impl Server {
                 from,
                 &mut self.quic_config,
             )?;
+            println!("Server: connection accepted");
 
             // Process initial packet
             server_conn.process_packet(&mut buf[..len], from, self.socket.local_addr()?)?;
+            println!("Server: initial packet processed");
 
-            // Send handshake packets
+            // Send handshake response packets
             server_conn.send_packets(&self.socket, &mut out)?;
+            println!("Server: sent handshake response");
 
-            // Handle the connection session
+            // Handle the connection session (this will complete handshake and handle data)
             self.handle_session(&mut server_conn, &mut buf, &mut out)?;
 
             break; // Single connection demo
