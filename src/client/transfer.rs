@@ -1106,6 +1106,9 @@ impl Transfer {
         
         info!("Client: starting file chunk upload...");
         
+        // Set socket to non-blocking mode once for better performance
+        socket.set_nonblocking(true)?;
+        
         // Convert existing hashes to HashSet for efficient lookup
         let existing_set: HashSet<&[u8]> = existing_hashes.iter()
             .map(|v| v.as_slice())
@@ -1170,17 +1173,15 @@ impl Transfer {
                 continue;
             }
             
-            // Send length prefix (4 bytes, big-endian)
+            // Combine length prefix and chunk data into single send (avoid double flow control)
             let len_bytes = (chunk_packet.len() as u32).to_be_bytes();
-            self.send_data_with_flow_control(
-                connection, socket, buf, out, local_addr,
-                STREAM_DATA, &len_bytes, false
-            )?;
+            let mut combined_data = Vec::with_capacity(4 + chunk_packet.len());
+            combined_data.extend_from_slice(&len_bytes);
+            combined_data.extend_from_slice(&chunk_packet);
             
-            // Send chunk packet data
             self.send_data_with_flow_control(
                 connection, socket, buf, out, local_addr,
-                STREAM_DATA, &chunk_packet, is_last
+                STREAM_DATA, &combined_data, is_last
             )?;
             
             bytes_sent += chunk_packet.len() as u64;
@@ -1271,36 +1272,30 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_retries = 5000;  // Increased from 1000 for slower networks
-        let mut retry_count = 0;
-        let mut consecutive_no_progress = 0;
+        let max_iterations = 50000;  // More iterations, but faster loop
+        let mut iterations = 0;
         
         while written < data.len() {
-            let before_written = written;
-            
-            // Try to write to stream
-            match connection.stream_send(stream_id, &data[written..], fin && written + 1 >= data.len()) {
+            // Try to write to stream - write as much as possible
+            match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
                 Ok(w) if w > 0 => {
                     written += w;
-                    retry_count = 0;
-                    consecutive_no_progress = 0;
                 }
                 Ok(_) => {
                     // 0 bytes written, flow control blocked
                 }
                 Err(ref e) if format!("{:?}", e).contains("Done") => {
-                    // Stream not ready, need to flush
+                    // Stream not ready
                 }
                 Err(e) => return Err(e),
             }
             
-            // Aggressively flush packets - send everything available
+            // Flush packets - send everything available
             while let Ok((len, send_info)) = connection.send(out) {
                 socket.send_to(&out[..len], send_info.to)?;
             }
             
-            // Receive ACKs to open flow control window - non-blocking
-            socket.set_read_timeout(Some(Duration::from_millis(1)))?;
+            // Try to receive ACKs - truly non-blocking, no sleep
             match socket.recv_from(buf) {
                 Ok((len, from)) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
@@ -1311,33 +1306,12 @@ impl Transfer {
                 Err(e) => return Err(Error::from(e)),
             }
             
-            // Check if we made progress
-            if written == before_written {
-                consecutive_no_progress += 1;
-                
-                // Log flow control stalls periodically
-                if retry_count > 0 && retry_count % 1000 == 0 {
-                    warn!(
-                        "Client: flow control stalled - sent {}/{} bytes ({:.1}%), {} retries",
-                        written, data.len(), (written as f64 / data.len() as f64) * 100.0, retry_count
-                    );
-                }
-                
-                // Progressive backoff: sleep longer as consecutive failures increase
-                if consecutive_no_progress > 5 {
-                    let backoff_ms = std::cmp::min(consecutive_no_progress / 10, 10);
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                }
-                
-                retry_count += 1;
-                if retry_count >= max_retries {
-                    return Err(Error::Protocol(format!(
-                        "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} retries",
-                        written, data.len(), (written as f64 / data.len() as f64) * 100.0, max_retries
-                    )));
-                }
-            } else {
-                consecutive_no_progress = 0;
+            iterations += 1;
+            if iterations >= max_iterations {
+                return Err(Error::Protocol(format!(
+                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} iterations",
+                    written, data.len(), (written as f64 / data.len() as f64) * 100.0, max_iterations
+                )));
             }
         }
         
