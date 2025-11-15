@@ -1,5 +1,5 @@
 use clap::Parser;
-use sftpx::compression; 
+use sftpx::compression;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]

@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package chunk;
+
+message Chunk {
+    uint64 index = 1;
+    uint64 offset = 2;
+    bytes data = 3;
+    string hash_hex = 4;
+}
+
+message ChunkTable {
+    uint64 file_size = 1;
+    uint64 chunk_size = 2;
+    repeated Chunk chunks = 3;
+}
