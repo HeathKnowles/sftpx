@@ -16,7 +16,7 @@ ClientConfig {
     max_retries: 3,
     timeout: 30 seconds,
     session_dir: ".sftpx/sessions",
-    verify_cert: false,               // Disabled by default for easier testing
+    verify_cert: true,               // Disabled by default for easier testing
     ca_cert_path: Some("certs/cert.pem"),  // Automatically points to cert file
 }
 ```
