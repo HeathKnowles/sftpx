@@ -209,7 +209,7 @@ impl TransferManager {
     ) -> Result<(PathBuf, u64), Box<dyn std::error::Error>> {
         use crate::transport::manifest_stream::ManifestReceiver;
         use crate::client::receiver::FileReceiver;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         
         log::info!("TransferManager: starting integrated file receive");
         
@@ -533,12 +533,11 @@ impl TransferManager {
         
         let mut stream_buffer = Vec::new(); // Accumulate stream data
         let mut chunk_buffer = vec![0u8; 65535];
-        let receive_timeout = Duration::from_secs(30);
-        let receive_start = Instant::now();
         let mut last_progress = 0.0;
         let mut chunks_received = 0u64;
         let mut expecting_length = true;
         let mut expected_chunk_size = 0usize;
+        let mut stream_finished = false;
         
         loop {
             // Receive network packets first
@@ -607,6 +606,7 @@ impl TransferManager {
                     
                     if fin {
                         log::info!("Server: received FIN on data stream");
+                        stream_finished = true;
                         break;
                     }
                 }
@@ -617,18 +617,12 @@ impl TransferManager {
                         break;
                     }
                     
-                    if receive_start.elapsed() > receive_timeout {
-                        return Err("File receive timeout".into());
-                    }
-                    
+                    // Just wait for more data or FIN, no timeout
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 Err(quiche::Error::InvalidStreamState(_)) => {
                     // Stream not ready yet, wait for data
-                    if receive_start.elapsed() > receive_timeout {
-                        return Err("File receive timeout waiting for stream".into());
-                    }
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -642,10 +636,14 @@ impl TransferManager {
                 log::info!("Server: all chunks received!");
                 break;
             }
-            
-            if receive_start.elapsed() > receive_timeout {
-                return Err("File receive timeout".into());
-            }
+        }
+        
+        // If we exited due to FIN but file isn't complete, that's an error
+        if stream_finished && !receiver.is_complete() {
+            return Err(format!(
+                "Stream closed with FIN but file incomplete: {} of {} chunks received",
+                chunks_received, manifest.total_chunks
+            ).into());
         }
         
         // Finalize file
