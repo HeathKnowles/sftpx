@@ -1,1 +1,27 @@
 // FlatBuffer schema for high-performance chunk data
+// This schema defines the structure for chunk packets in the SFTPX protocol
+
+namespace sftpx.protocol;
+
+// Chunk packet structure containing all metadata and data for a single chunk
+table ChunkPacket {
+  // Unique chunk identifier (chunk number)
+  chunk_id: ulong;
+  
+  // Byte offset where this chunk starts in the file
+  byte_offset: ulong;
+  
+  // Length of the chunk data in bytes
+  chunk_length: uint;
+  
+  // Checksum of the chunk data (e.g., Blake3 hash)
+  checksum: [ubyte];
+  
+  // Flag indicating this is the last chunk of the file
+  end_of_file: bool;
+  
+  // The actual chunk data payload
+  data: [ubyte];
+}
+
+root_type ChunkPacket;

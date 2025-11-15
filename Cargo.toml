@@ -9,17 +9,18 @@ quiche = "0.24.6"
 
 # Cryptography
 ring = "0.17"
+blake3 = "1.5"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Protocol buffers (uncomment when ready)
-# prost = "0.13"
-# bytes = "1.0"
+# Protocol buffers
+prost = "0.13"
+bytes = "1.8"
 
-# FlatBuffers (uncomment when ready)
-# flatbuffers = "24.3"
+# FlatBuffers
+flatbuffers = "24.12"
 
 # Logging
 log = "0.4"
@@ -35,8 +36,8 @@ indicatif = "0.17"
 # tokio = { version = "1", features = ["full"] }
 
 [build-dependencies]
-# Uncomment when proto files are ready
-# prost-build = "0.13"
+prost-build = "0.13"
+flatc-rust = "0.2"
 
 [dev-dependencies]
 tempfile = "3.8"

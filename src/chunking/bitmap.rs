@@ -22,6 +22,12 @@ impl ChunkBitmap {
     /// 
     /// # Arguments
     /// * `initial_capacity` - Initial number of chunks to allocate for (or 0 for lazy allocation)
+    /// 
+    /// 
+    /// pub fn new(_total_chunks: u64) -> Self {
+        // Self {}
+    // }
+    /// 
     pub fn new(initial_capacity: u32) -> Self {
         let capacity = if initial_capacity > 0 {
             initial_capacity

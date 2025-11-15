@@ -2,10 +2,7 @@
 
 use super::connection::ServerConnection;
 use super::sender::DataSender;
-use super::streams::StreamManager;
 use std::path::Path;
-use std::fs::File;
-use std::io::Read;
 
 const DEFAULT_CHUNK_SIZE: usize = 8192;
 
@@ -32,7 +29,7 @@ impl TransferManager {
         }
     }
 
-    /// Transfer a file to a client
+    /// Transfer a file to a client using chunked protocol
     /// 
     /// # Arguments
     /// * `connection` - The server connection
@@ -46,107 +43,63 @@ impl TransferManager {
         connection: &mut ServerConnection,
         stream_id: u64,
         file_path: &Path,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        let mut file = File::open(file_path)?;
-        let mut buffer = vec![0u8; self.chunk_size];
-        let mut total_sent = 0;
-
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         println!("TransferManager: starting file transfer from {:?}", file_path);
 
-        loop {
-            match file.read(&mut buffer) {
-                Ok(0) => {
-                    // End of file - send with FIN flag
-                    println!("TransferManager: file transfer complete ({} bytes)", total_sent);
-                    break;
-                }
-                Ok(n) => {
-                    let sent = self.sender.send_data(
-                        connection,
-                        stream_id,
-                        &buffer[..n],
-                        false,
-                    )?;
-                    total_sent += sent;
-                }
-                Err(e) => {
-                    eprintln!("TransferManager: error reading file: {:?}", e);
-                    return Err(Box::new(e));
-                }
-            }
-        }
+        let bytes_sent = self.sender.send_file(
+            connection,
+            stream_id,
+            file_path,
+            Some(self.chunk_size),
+        )?;
 
-        // Send FIN
-        self.sender.send_data(connection, stream_id, &[], true)?;
-
-        Ok(total_sent)
+        println!("TransferManager: file transfer complete ({} bytes)", bytes_sent);
+        
+        Ok(bytes_sent)
     }
 
-    /// Transfer data to a client using multiple streams
+    /// Transfer raw data to a client on a stream
     /// 
     /// # Arguments
     /// * `connection` - The server connection
-    /// * `stream_manager` - The stream manager
+    /// * `stream_id` - The stream ID to send data on
     /// * `data` - The data to transfer
     /// 
     /// # Returns
     /// The total number of bytes transferred
-    pub fn transfer_data_multistream(
+    pub fn transfer_data(
         &mut self,
         connection: &mut ServerConnection,
-        stream_manager: &StreamManager,
+        stream_id: u64,
         data: &[u8],
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        let stream_ids: Vec<u64> = stream_manager
-            .active_streams()
-            .iter()
-            .map(|s| s.stream_id)
-            .collect();
-
-        if stream_ids.is_empty() {
-            return Err("No active streams available".into());
-        }
-
         println!(
-            "TransferManager: transferring {} bytes across {} streams",
+            "TransferManager: transferring {} bytes on stream {}",
             data.len(),
-            stream_ids.len()
+            stream_id
         );
 
-        self.sender.send_distributed(
-            connection,
-            &stream_ids,
-            data,
-            self.chunk_size,
-        )
+        let sent = self.sender.send_data(connection, stream_id, data, true)?;
+        Ok(sent)
     }
 
-    /// Transfer a file using multiple streams for parallel transfer
+    /// Transfer a file on a specific stream
+    /// This is an alias for transfer_file for backwards compatibility
     /// 
     /// # Arguments
     /// * `connection` - The server connection
-    /// * `stream_manager` - The stream manager
+    /// * `stream_id` - The stream ID to send the file on
     /// * `file_path` - Path to the file to transfer
     /// 
     /// # Returns
     /// The total number of bytes transferred
-    pub fn transfer_file_multistream(
+    pub fn transfer_file_on_stream(
         &mut self,
         connection: &mut ServerConnection,
-        stream_manager: &StreamManager,
+        stream_id: u64,
         file_path: &Path,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        let mut file = File::open(file_path)?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-
-        println!(
-            "TransferManager: loaded {} bytes from {:?}",
-            data.len(),
-            file_path
-        );
-
-        self.transfer_data_multistream(connection, stream_manager, &data)
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        self.transfer_file(connection, stream_id, file_path)
     }
 
     /// Get the current chunk size
@@ -160,8 +113,13 @@ impl TransferManager {
     }
 
     /// Get total bytes sent
-    pub fn total_bytes_sent(&self) -> usize {
+    pub fn total_bytes_sent(&self) -> u64 {
         self.sender.total_bytes_sent()
+    }
+
+    /// Get total chunks sent
+    pub fn total_chunks_sent(&self) -> u64 {
+        self.sender.total_chunks_sent()
     }
 }
 

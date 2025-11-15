@@ -1,1 +1,26 @@
 // Protobuf schema for ChunkPacket message
+
+syntax = "proto3";
+
+package sftpx.protocol;
+
+// Chunk packet containing data and metadata for a single file chunk
+message ChunkPacket {
+  // Unique chunk identifier (chunk number, starting from 0)
+  uint64 chunk_id = 1;
+  
+  // Byte offset where this chunk starts in the file
+  uint64 byte_offset = 2;
+  
+  // Length of the chunk data in bytes
+  uint32 chunk_length = 3;
+  
+  // Checksum of the chunk data (BLAKE3 hash)
+  bytes checksum = 4;
+  
+  // Flag indicating this is the last chunk of the file
+  bool end_of_file = 5;
+  
+  // The actual chunk data payload
+  bytes data = 6;
+}

@@ -62,4 +62,10 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<quiche::Error> for Error {
+    fn from(err: quiche::Error) -> Self {
+        Error::Quic(format!("{:?}", err))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

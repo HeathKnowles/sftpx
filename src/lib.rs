@@ -1,12 +1,15 @@
-// Library root - exports public API
-
 pub mod common;
 pub mod client;
-pub mod server;  // Uncomment when server is implemented
-// pub mod protocol;  // Uncomment when protocol is implemented
+pub mod server;
+pub mod protocol;
+pub mod proto;
+pub mod chunking;
 // pub mod transport;  // Uncomment when transport is implemented
-pub mod chunking;  // Bitmap implementation
 // pub mod storage;  // Uncomment when storage is implemented
+pub mod logging;
+pub mod resumption;
+pub mod retransmission;
+pub mod validation;
 
 // Re-export commonly used items
 pub use common::{Error, Result, ClientConfig};
