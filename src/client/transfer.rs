@@ -736,15 +736,14 @@ impl Transfer {
         session_id: &str,
         chunk_hashes: Vec<Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>> {
-        // Send hash check request on server-initiated stream (STREAM_HASH_CHECK)
+        // Send hash check request on client-initiated stream (STREAM_HASH_CHECK = 16)
+        // Client opens the stream and both parties can read/write
         let hash_sender = HashCheckRequestSender::new();
         
         let send_result = hash_sender.send_request(
             session_id.to_string(),
             chunk_hashes.clone(),
             |data, fin| {
-                // Send on STREAM_HASH_CHECK - this is a server-initiated bidirectional stream
-                // The server opens it (ID 1), but client can write to it
                 connection.stream_send(STREAM_HASH_CHECK, data, fin)
             },
         )?;

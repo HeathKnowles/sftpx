@@ -8,11 +8,11 @@ const NUM_STREAMS: usize = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamType {
     Control,      // Client-initiated (ID 0)
-    HashCheck,    // Server-initiated (ID 1)
     Manifest,     // Client-initiated (ID 4)
-    Delta,        // Server-initiated (ID 5)
     Data,         // Client-initiated (ID 8)
     Status,       // Client-initiated (ID 12)
+    HashCheck,    // Client-initiated (ID 16) - changed from server-initiated
+    Delta,        // Server-initiated (ID 5)
 }
 
 impl StreamType {
@@ -20,11 +20,11 @@ impl StreamType {
     pub fn stream_id(&self) -> u64 {
         match self {
             StreamType::Control => 0,      // Client-initiated
-            StreamType::HashCheck => 1,    // Server-initiated
             StreamType::Manifest => 4,     // Client-initiated
-            StreamType::Delta => 5,        // Server-initiated
             StreamType::Data => 8,         // Client-initiated
             StreamType::Status => 12,      // Client-initiated
+            StreamType::HashCheck => 16,   // Client-initiated (changed from 1)
+            StreamType::Delta => 5,        // Server-initiated
         }
     }
 
@@ -32,17 +32,17 @@ impl StreamType {
     pub fn all() -> [StreamType; NUM_STREAMS] {
         [
             StreamType::Control,
-            StreamType::HashCheck,
             StreamType::Manifest,
-            StreamType::Delta,
             StreamType::Data,
             StreamType::Status,
+            StreamType::HashCheck,
+            StreamType::Delta,
         ]
     }
     
     /// Check if this stream is server-initiated
     pub fn is_server_initiated(&self) -> bool {
-        matches!(self, StreamType::HashCheck | StreamType::Delta)
+        matches!(self, StreamType::Delta)  // Only Delta is server-initiated now
     }
 }
 

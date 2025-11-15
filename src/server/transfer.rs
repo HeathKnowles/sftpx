@@ -8,7 +8,7 @@ use crate::protocol::hash_check::{HashCheckRequestReceiver, HashCheckResponseSen
 use std::path::{Path, PathBuf};
 
 const DEFAULT_CHUNK_SIZE: usize = 8192;
-const STREAM_HASH_CHECK: u64 = 1;  // Server-initiated bidirectional stream for hash checks
+const STREAM_HASH_CHECK: u64 = 16;  // Client-initiated bidirectional stream for hash checks (changed from 1)
 
 /// Manages file transfers to clients
 pub struct TransferManager {
@@ -260,7 +260,7 @@ impl TransferManager {
             manifest.total_chunks, manifest.file_size);
         
         // --- HASH CHECK PHASE (Deduplication) ---
-        log::info!("Server: waiting for hash check request on stream {}...", STREAM_HASH_CHECK);
+        log::info!("Server: waiting for hash check request on stream {} (client-initiated)...", STREAM_HASH_CHECK);
         
         // Create chunk index
         use crate::chunking::ChunkHashIndex;
@@ -271,7 +271,7 @@ impl TransferManager {
             ChunkHashIndex::new(&std::env::temp_dir()).expect("Failed to create temp index")
         });
         
-        // Receive hash check request on server-initiated stream STREAM_HASH_CHECK
+        // Receive hash check request on client-initiated stream STREAM_HASH_CHECK
         let mut hash_request_receiver = HashCheckRequestReceiver::new();
         let mut hash_request_received = false;
         let mut chunk_hashes_to_check = vec![];
