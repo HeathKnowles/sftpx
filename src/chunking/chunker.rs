@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::common::error::{Error, Result};
 use crate::common::types::DEFAULT_CHUNK_SIZE;
 use crate::protocol::chunk::ChunkPacketBuilder;
+use crate::chunking::compress::CompressionType;
 
 /// File chunker that splits files into fixed-size chunks with metadata
 pub struct FileChunker {
@@ -23,6 +24,20 @@ impl FileChunker {
     /// * `file_path` - Path to the file to chunk
     /// * `chunk_size` - Size of each chunk in bytes (optional, defaults to DEFAULT_CHUNK_SIZE)
     pub fn new(file_path: &Path, chunk_size: Option<usize>) -> Result<Self> {
+        Self::with_compression(file_path, chunk_size, CompressionType::None)
+    }
+    
+    /// Create a new file chunker with compression
+    /// 
+    /// # Arguments
+    /// * `file_path` - Path to the file to chunk
+    /// * `chunk_size` - Size of each chunk in bytes (optional, defaults to DEFAULT_CHUNK_SIZE)
+    /// * `compression` - Compression type to use
+    pub fn with_compression(
+        file_path: &Path,
+        chunk_size: Option<usize>,
+        compression: CompressionType,
+    ) -> Result<Self> {
         let mut file = File::open(file_path)?;
         let file_size = file.metadata()?.len();
         let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
@@ -36,7 +51,7 @@ impl FileChunker {
             chunk_size,
             current_chunk: 0,
             bytes_read: 0,
-            builder: ChunkPacketBuilder::with_capacity(chunk_size + 1024),
+            builder: ChunkPacketBuilder::with_compression(compression),
         })
     }
 

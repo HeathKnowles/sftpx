@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use crate::common::error::{Error, Result};
+use crate::chunking::compress::CompressionType;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -15,6 +16,7 @@ pub struct ClientConfig {
     pub session_dir: PathBuf,
     pub verify_cert: bool,
     pub ca_cert_path: Option<PathBuf>,
+    pub compression: CompressionType,
 }
 
 impl Default for ClientConfig {
@@ -28,6 +30,7 @@ impl Default for ClientConfig {
             session_dir: PathBuf::from(".sftpx/sessions"),
             verify_cert: false, // Default to no verification for easier testing
             ca_cert_path: Some(PathBuf::from("certs/cert.pem")), // Default cert path
+            compression: CompressionType::None,  // Default: no compression
         }
     }
 }
@@ -81,6 +84,11 @@ impl ClientConfig {
     
     pub fn with_max_retries(mut self, retries: usize) -> Self {
         self.max_retries = retries;
+        self
+    }
+    
+    pub fn with_compression(mut self, compression: CompressionType) -> Self {
+        self.compression = compression;
         self
     }
 }

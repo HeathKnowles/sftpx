@@ -21,6 +21,12 @@ message ChunkPacket {
   // Flag indicating this is the last chunk of the file
   bool end_of_file = 5;
   
-  // The actual chunk data payload
+  // The actual chunk data payload (may be compressed)
   bytes data = 6;
+  
+  // Compression type used (0=None, 1=LZ4, 2=LZ4-HC, 3=Zstd)
+  uint32 compression_type = 7;
+  
+  // Original (uncompressed) size of the chunk data
+  uint32 original_size = 8;
 }

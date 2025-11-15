@@ -24,6 +24,8 @@ pub enum Error {
     DiskFull,
     ConfigError(String),
     TlsError(String),
+    Compression(String),
+    Decompression(String),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +52,8 @@ impl fmt::Display for Error {
             Error::DiskFull => write!(f, "Disk full"),
             Error::ConfigError(e) => write!(f, "Configuration error: {}", e),
             Error::TlsError(e) => write!(f, "TLS error: {}", e),
+            Error::Compression(e) => write!(f, "Compression error: {}", e),
+            Error::Decompression(e) => write!(f, "Decompression error: {}", e),
         }
     }
 }

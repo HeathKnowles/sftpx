@@ -8,7 +8,7 @@ use crate::common::error::{Error, Result};
 use crate::common::config::ClientConfig;
 use crate::common::types::*;
 use crate::protocol::manifest::ManifestBuilder;
-use crate::transport::manifest_stream::{ManifestReceiver, ManifestSender};
+use crate::transport::manifest_stream::ManifestReceiver;
 use crate::protocol::control::ControlMessage;
 use crate::client::receiver::FileReceiver;
 use super::connection::ClientConnection;
@@ -371,7 +371,7 @@ impl Transfer {
         info!("Client: initialized streams");
         
         // --- MANIFEST BUILD AND SEND PHASE ---
-        let total_bytes = self.send_manifest_phase(
+        let (manifest_bytes, manifest, existing_hashes) = self.send_manifest_phase(
             &socket,
             &mut connection,
             &mut buf,
@@ -388,6 +388,8 @@ impl Transfer {
             &mut out,
             local_addr,
             file_path,
+            &manifest,
+            &existing_hashes,
         )?;
         
         // Clean close
@@ -397,7 +399,7 @@ impl Transfer {
         }
         
         self.state = TransferState::Completed;
-        let total = total_bytes + chunks_bytes;
+        let total = manifest_bytes + chunks_bytes;
         info!("Client: upload complete! Sent {} bytes total", total);
         
         Ok(total)
@@ -639,6 +641,7 @@ impl Transfer {
     }
     
     /// Send manifest phase - build and send manifest to server
+    /// Returns (bytes_sent, manifest, existing_hashes)
     fn send_manifest_phase(
         &mut self,
         socket: &UdpSocket,
@@ -647,7 +650,9 @@ impl Transfer {
         out: &mut [u8],
         local_addr: std::net::SocketAddr,
         file_path: &Path,
-    ) -> Result<u64> {
+    ) -> Result<(u64, crate::protocol::messages::Manifest, Vec<Vec<u8>>)> {
+        use crate::protocol::hash_check::{HashCheckRequestSender, HashCheckResponseReceiver};
+        
         info!("Client: building manifest for upload...");
         
         // Generate session ID
@@ -668,23 +673,156 @@ impl Transfer {
             manifest.total_chunks, manifest.file_size);
         
         // Send manifest on STREAM_MANIFEST
-        let manifest_sender = ManifestSender::new();
-        let mut total_sent = 0u64;
+        // Encode manifest first
+        let encoded = manifest.encode_to_vec();
+        info!("Client: manifest encoded ({} bytes)", encoded.len());
         
-        manifest_sender.send_manifest(&manifest, |data, fin| {
-            let written = connection.stream_send(STREAM_MANIFEST, data, fin)?;
-            total_sent += written as u64;
+        // Send with retry on partial writes
+        let mut total_sent = 0usize;
+        let mut offset = 0usize;
+        let max_retries = 100;
+        let mut retries = 0;
+        
+        while offset < encoded.len() {
+            let remaining = &encoded[offset..];
+            let is_last = offset + remaining.len() == encoded.len();
             
-            // Flush packets
+            match connection.stream_send(STREAM_MANIFEST, remaining, is_last) {
+                Ok(written) => {
+                    if written > 0 {
+                        offset += written;
+                        total_sent += written;
+                        retries = 0; // Reset retry counter on progress
+                        
+                        // Flush packets
+                        while let Ok((len, send_info)) = connection.send(out) {
+                            socket.send_to(&out[..len], send_info.to)?;
+                        }
+                    } else {
+                        // No bytes written, wait and retry
+                        retries += 1;
+                        if retries > max_retries {
+                            return Err(Error::Protocol(format!(
+                                "Manifest send stalled: {}/{} bytes sent",
+                                total_sent, encoded.len()
+                            )));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(_e) => {
+                    // Stream not writable, flush and retry
+                    retries += 1;
+                    if retries > max_retries {
+                        return Err(Error::Protocol(format!(
+                            "Manifest send timeout: {}/{} bytes sent",
+                            total_sent, encoded.len()
+                        )));
+                    }
+                    
+                    while let Ok((len, send_info)) = connection.send(out) {
+                        socket.send_to(&out[..len], send_info.to)?;
+                    }
+                    
+                    // Receive ACKs
+                    socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+                    if let Ok((len, from)) = socket.recv_from(buf) {
+                        let recv_info = quiche::RecvInfo { from, to: local_addr };
+                        let _ = connection.recv(&mut buf[..len], recv_info);
+                    }
+                    
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        
+        info!("Client: manifest sent ({} bytes)", total_sent);
+        
+        // Send hash check request on STREAM_CONTROL (optional - skip if it fails)
+        info!("Client: sending hash check request for {} chunks", manifest.chunk_hashes.len());
+        let hash_sender = HashCheckRequestSender::new();
+        
+        let hash_sent = hash_sender.send_request(
+            session_id.clone(),
+            manifest.chunk_hashes.clone(),
+            |data, fin| {
+                let written = connection.stream_send(STREAM_CONTROL, data, fin)?;
+                
+                // Flush packets
+                while let Ok((len, send_info)) = connection.send(out) {
+                    socket.send_to(&out[..len], send_info.to)?;
+                }
+                
+                Ok(written)
+            }
+        );
+        
+        if hash_sent.is_err() {
+            info!("Client: hash check request failed, proceeding without dedup");
+            return Ok((total_sent as u64, manifest, vec![]));
+        }
+        
+        info!("Client: hash check request sent, waiting for response...");
+        
+        // Wait for hash check response on STREAM_CONTROL
+        let mut hash_receiver = HashCheckResponseReceiver::new();
+        let hash_timeout = Duration::from_secs(10);
+        let hash_start = Instant::now();
+        
+        let existing_hashes = 'hash_loop: loop {
+            // Receive packets
+            socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo { from, to: local_addr };
+                    let _ = connection.recv(&mut buf[..len], recv_info);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock ||
+                          e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(Error::from(e)),
+            }
+            
+            // Check for readable streams
+            let readable: Vec<u64> = connection.readable().collect();
+            for stream_id in readable {
+                if stream_id == STREAM_CONTROL {
+                    loop {
+                        match connection.stream_recv(stream_id, buf) {
+                            Ok((read, fin)) => {
+                                if read == 0 {
+                                    break;
+                                }
+                                
+                                if let Some(response) = hash_receiver.receive_chunk(&buf[..read], fin)? {
+                                    info!("Client: received hash check response - {} hashes exist on server", 
+                                        response.existing_hashes.len());
+                                    break 'hash_loop response.existing_hashes;
+                                }
+                                
+                                if fin {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            
+            // Send any pending packets
             while let Ok((len, send_info)) = connection.send(out) {
                 socket.send_to(&out[..len], send_info.to)?;
             }
             
-            Ok(written)
-        })?;
+            if hash_start.elapsed() > hash_timeout {
+                info!("Client: hash check response timeout, proceeding without dedup");
+                break vec![];
+            }
+            
+            std::thread::sleep(Duration::from_millis(10));
+        };
         
-        info!("Client: manifest sent ({} bytes)", total_sent);
-        Ok(total_sent)
+        Ok((total_sent as u64, manifest, existing_hashes))
     }
     
     /// Send file phase - send file chunks to server
@@ -696,20 +834,52 @@ impl Transfer {
         out: &mut [u8],
         local_addr: std::net::SocketAddr,
         file_path: &Path,
+        manifest: &crate::protocol::messages::Manifest,
+        existing_hashes: &[Vec<u8>],
     ) -> Result<u64> {
         use crate::chunking::FileChunker;
+        use std::collections::HashSet;
         
         info!("Client: starting file chunk upload...");
         
-        let mut chunker = FileChunker::new(file_path, Some(self.config.chunk_size))?;
+        // Convert existing hashes to HashSet for efficient lookup
+        let existing_set: HashSet<&[u8]> = existing_hashes.iter()
+            .map(|v| v.as_slice())
+            .collect();
+        
+        let mut chunker = FileChunker::with_compression(
+            file_path, 
+            Some(self.config.chunk_size),
+            self.config.compression
+        )?;
         let total_chunks = chunker.total_chunks();
         let mut bytes_sent = 0u64;
         let mut chunk_count = 0u64;
+        let mut chunks_skipped = 0u64;
         
-        info!("Client: uploading {} chunks ({} bytes)", total_chunks, chunker.file_size());
+        info!("Client: uploading {} chunks ({} bytes) with compression: {:?}", 
+            total_chunks, chunker.file_size(), self.config.compression);
+        
+        if !existing_set.is_empty() {
+            info!("Client: {} chunks already exist on server (will skip)", existing_set.len());
+        }
         
         while let Some(chunk_packet) = chunker.next_chunk()? {
             let is_last = chunk_count == total_chunks - 1;
+            
+            // Check if this chunk's hash exists on server
+            let chunk_hash = &manifest.chunk_hashes[chunk_count as usize];
+            let should_skip = existing_set.contains(chunk_hash.as_slice());
+            
+            if should_skip {
+                chunks_skipped += 1;
+                chunk_count += 1;
+                
+                if chunk_count % 10 == 0 {
+                    info!("Client: skipped chunk {}/{} (dedup)", chunk_count, total_chunks);
+                }
+                continue;
+            }
             
             // Send length prefix (4 bytes, big-endian)
             let len_bytes = (chunk_packet.len() as u32).to_be_bytes();
@@ -731,6 +901,12 @@ impl Transfer {
                 info!("Client: sent chunk {}/{} ({:.1}%)", 
                     chunk_count, total_chunks, (chunk_count as f64 / total_chunks as f64) * 100.0);
             }
+        }
+        
+        if chunks_skipped > 0 {
+            info!("Client: deduplication saved {} chunks ({:.1}%)", 
+                chunks_skipped, 
+                (chunks_skipped as f64 / total_chunks as f64) * 100.0);
         }
         
         // Final flush - keep sending until connection is drained

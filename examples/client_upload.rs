@@ -3,6 +3,7 @@
 
 use sftpx::client::transfer::Transfer;
 use sftpx::common::config::ClientConfig;
+use sftpx::chunking::compress::CompressionType;
 use std::env;
 use std::path::Path;
 
@@ -49,14 +50,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let config = ClientConfig::new(server_addr, server_name)
         .disable_cert_verification()  // Skip cert verification for testing
-        .with_chunk_size(262144)?; // 256 KB chunks
+        .with_chunk_size(262144)?     // 256 KB chunks
+        .with_compression(CompressionType::Lz4);  // Enable LZ4 compression
     
     println!("Client Configuration:");
     println!("  Server: {}", server_addr);
     println!("  Chunk Size: {} bytes ({} KB)", config.chunk_size, config.chunk_size / 1024);
+    println!("  Compression: {:?}", config.compression);
     println!("\nFeatures:");
     println!("  ✓ Integrated orchestration (handshake → manifest → chunks)");
     println!("  ✓ BLAKE3 integrity verification per chunk");
+    println!("  ✓ {:?} compression enabled", config.compression);
+    println!("  ✓ Chunk-level deduplication (hash-based)");
     println!("  ✓ Protocol Buffers serialization");
     println!("  ✓ 4 QUIC streams (Control, Manifest, Data, Status)");
     println!("\nStarting upload...\n");

@@ -262,6 +262,118 @@ impl TransferManager {
         log::info!("Manifest received: {} chunks, {} bytes", 
             manifest.total_chunks, manifest.file_size);
         
+        // --- HASH CHECK PHASE ---
+        // Wait for hash check request on control stream (stream 0)
+        log::info!("Server: waiting for hash check request on control stream...");
+        use crate::protocol::hash_check::{HashCheckRequestReceiver, HashCheckResponseSender};
+        use crate::chunking::ChunkHashIndex;
+        
+        let control_stream = 0u64;
+        let mut hash_request_receiver = HashCheckRequestReceiver::new();
+        let hash_check_timeout = Duration::from_secs(10);
+        let hash_check_start = Instant::now();
+        let mut control_buffer = vec![0u8; 65535];
+        
+        let hash_request = loop {
+            // Receive network packets
+            socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+            if let Ok((len, from)) = socket.recv_from(&mut buf) {
+                let _ = connection.process_packet(&mut buf[..len], from, socket.local_addr()?);
+            }
+            
+            // Send any response packets
+            let _ = connection.send_packets(socket, &mut out);
+            
+            // Read from control stream
+            match connection.stream_recv(control_stream, &mut control_buffer) {
+                Ok((read, fin)) => {
+                    if read > 0 {
+                        match hash_request_receiver.receive_chunk(&control_buffer[..read], fin) {
+                            Ok(Some(req)) => {
+                                log::info!("Server: received hash check request with {} hashes", req.chunk_hashes.len());
+                                break req;
+                            }
+                            Ok(None) => {
+                                // Need more data
+                                continue;
+                            }
+                            Err(e) => {
+                                log::warn!("Server: hash check request error: {:?}", e);
+                                // Continue without dedup if request fails
+                                break crate::protocol::messages::HashCheckRequest {
+                                    session_id: manifest.session_id.clone(),
+                                    chunk_hashes: vec![],
+                                };
+                            }
+                        }
+                    }
+                }
+                Err(quiche::Error::Done) => {
+                    if hash_check_start.elapsed() > hash_check_timeout {
+                        log::warn!("Server: hash check timeout, proceeding without dedup");
+                        // Continue without dedup
+                        break crate::protocol::messages::HashCheckRequest {
+                            session_id: manifest.session_id.clone(),
+                            chunk_hashes: vec![],
+                        };
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("Server: hash check stream error: {:?}, proceeding without dedup", e);
+                    // Continue without dedup
+                    break crate::protocol::messages::HashCheckRequest {
+                        session_id: manifest.session_id.clone(),
+                        chunk_hashes: vec![],
+                    };
+                }
+            }
+        };
+        
+        // Load or create chunk hash index
+        let index_dir = output_dir.join(".sftpx");
+        std::fs::create_dir_all(&index_dir)?;
+        
+        let mut chunk_index = ChunkHashIndex::new(&index_dir).unwrap_or_else(|e| {
+            log::warn!("Server: failed to create/load chunk index: {:?}, creating new", e);
+            // Fallback - shouldn't happen but handle gracefully
+            ChunkHashIndex::new(&std::env::temp_dir()).expect("Failed to create temp index")
+        });
+        
+        // Check which hashes already exist
+        let existing_hashes = if !hash_request.chunk_hashes.is_empty() {
+            let existing = chunk_index.check_hashes(&hash_request.chunk_hashes);
+            log::info!("Server: {} out of {} chunks already exist", 
+                existing.len(), hash_request.chunk_hashes.len());
+            existing
+        } else {
+            vec![]
+        };
+        
+        // Send hash check response (gracefully handle errors)
+        let hash_sender = HashCheckResponseSender::new();
+        match hash_sender.send_response(
+            hash_request.session_id.clone(),
+            existing_hashes.clone(),
+            |data, fin| {
+                let written = connection.stream_send(control_stream, data, fin)
+                    .map_err(|e| crate::common::error::Error::Protocol(format!("Stream send error: {:?}", e)))?;
+                
+                // Flush packets
+                connection.send_packets(socket, &mut out)
+                    .map_err(|e| crate::common::error::Error::Protocol(format!("Send packets error: {:?}", e)))?;
+                
+                Ok(written)
+            }
+        ) {
+            Ok(_) => {
+                log::info!("Server: sent hash check response with {} existing hashes", existing_hashes.len());
+            }
+            Err(e) => {
+                log::warn!("Server: failed to send hash check response: {:?}, proceeding without dedup", e);
+            }
+        }
+        
         // --- FILE RECEIVE PHASE ---
         log::info!("Receiving file chunks on stream {}...", data_stream);
         
@@ -394,6 +506,37 @@ impl TransferManager {
         // Finalize file
         let final_path = receiver.finalize()?;
         let bytes_received = manifest.file_size;
+        
+        // Update chunk index with received chunks
+        log::info!("Server: updating chunk index with {} chunks...", manifest.chunk_hashes.len());
+        use crate::chunking::ChunkLocation;
+        
+        for (chunk_idx, chunk_hash) in manifest.chunk_hashes.iter().enumerate() {
+            let chunk_offset = chunk_idx as u64 * manifest.chunk_size as u64;
+            let chunk_size = if chunk_idx == manifest.chunk_hashes.len() - 1 {
+                // Last chunk might be smaller
+                let remaining = manifest.file_size - chunk_offset;
+                std::cmp::min(remaining, manifest.chunk_size as u64) as u32
+            } else {
+                manifest.chunk_size
+            };
+            
+            let location = ChunkLocation {
+                file_path: final_path.clone(),
+                byte_offset: chunk_offset,
+                chunk_size,
+            };
+            
+            chunk_index.add_chunk(chunk_hash.clone(), location);
+        }
+        
+        // Save updated index
+        if let Err(e) = chunk_index.save() {
+            log::warn!("Server: failed to save chunk index: {:?}", e);
+        } else {
+            log::info!("Server: chunk index saved successfully ({} total unique chunks)", 
+                chunk_index.total_chunks());
+        }
         
         log::info!("TransferManager: file receive complete!");
         log::info!("  File saved to: {:?}", final_path);

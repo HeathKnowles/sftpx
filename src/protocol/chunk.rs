@@ -1,15 +1,25 @@
 // Chunk packet structures using Protocol Buffers
 use crate::common::error::{Error, Result};
 use crate::proto::sftpx::protocol::ChunkPacket;
+use crate::chunking::compress::{CompressionType, compress_chunk};
 use prost::Message;
 
 /// Builder for creating chunk packets using Protocol Buffers
-pub struct ChunkPacketBuilder;
+pub struct ChunkPacketBuilder {
+    compression: CompressionType,
+}
 
 impl ChunkPacketBuilder {
     /// Create a new chunk packet builder
     pub fn new() -> Self {
-        Self
+        Self {
+            compression: CompressionType::None,
+        }
+    }
+    
+    /// Create a new chunk packet builder with compression
+    pub fn with_compression(compression: CompressionType) -> Self {
+        Self { compression }
     }
 
     /// Create a new chunk packet builder with specified capacity (ignored in protobuf)
@@ -17,15 +27,15 @@ impl ChunkPacketBuilder {
         Self::new()
     }
 
-    /// Build a chunk packet
+    /// Build a chunk packet with optional compression
     /// 
     /// # Arguments
     /// * `chunk_id` - Unique chunk identifier (chunk number)
     /// * `byte_offset` - Starting byte offset in the file
-    /// * `chunk_length` - Length of the chunk data
-    /// * `checksum` - Blake3 checksum of the chunk data
+    /// * `chunk_length` - Length of the chunk data (original size)
+    /// * `checksum` - Blake3 checksum of the ORIGINAL (uncompressed) chunk data
     /// * `end_of_file` - True if this is the last chunk
-    /// * `data` - The actual chunk data
+    /// * `data` - The actual chunk data (will be compressed if compression is enabled)
     pub fn build(
         &mut self,
         chunk_id: u64,
@@ -43,13 +53,29 @@ impl ChunkPacketBuilder {
             )));
         }
 
+        // Compress data if compression is enabled
+        let (final_data, compression_type, original_size) = if self.compression != CompressionType::None {
+            let compressed = compress_chunk(data, self.compression)?;
+            // Only use compression if it actually reduces size
+            if compressed.len() < data.len() {
+                (compressed, self.compression.as_u8() as u32, chunk_length)
+            } else {
+                // Compression didn't help, use original
+                (data.to_vec(), CompressionType::None.as_u8() as u32, chunk_length)
+            }
+        } else {
+            (data.to_vec(), CompressionType::None.as_u8() as u32, chunk_length)
+        };
+
         let packet = ChunkPacket {
             chunk_id,
             byte_offset,
-            chunk_length,
+            chunk_length: final_data.len() as u32,  // Actual (possibly compressed) size
             checksum: checksum.to_vec(),
             end_of_file,
-            data: data.to_vec(),
+            data: final_data,
+            compression_type,
+            original_size,
         };
 
         let mut buffer = Vec::with_capacity(packet.encoded_len());
@@ -70,18 +96,30 @@ impl Default for ChunkPacketBuilder {
 pub struct ChunkPacketParser;
 
 impl ChunkPacketParser {
-    /// Parse a chunk packet from bytes
+    /// Parse a chunk packet from bytes and decompress if necessary
     pub fn parse(data: &[u8]) -> Result<ChunkPacketView> {
+        use crate::chunking::compress::{CompressionType, decompress_chunk};
+        
         let packet = ChunkPacket::decode(data)
             .map_err(|e| Error::DeserializationError(format!("Failed to decode chunk packet: {}", e)))?;
+
+        // Decompress data if compressed
+        let final_data = if packet.compression_type != 0 {
+            let compression_type = CompressionType::from_u8(packet.compression_type as u8)
+                .ok_or_else(|| Error::Decompression(format!("Unknown compression type: {}", packet.compression_type)))?;
+            
+            decompress_chunk(&packet.data, packet.original_size as usize, compression_type)?
+        } else {
+            packet.data
+        };
 
         Ok(ChunkPacketView {
             chunk_id: packet.chunk_id,
             byte_offset: packet.byte_offset,
-            chunk_length: packet.chunk_length,
+            chunk_length: final_data.len() as u32,  // Actual decompressed size
             checksum: packet.checksum,
             end_of_file: packet.end_of_file,
-            data: packet.data,
+            data: final_data,
         })
     }
 
@@ -93,15 +131,15 @@ impl ChunkPacketParser {
     }
 }
 
-/// View of a parsed chunk packet (owned data)
+/// View of a parsed chunk packet (owned data, decompressed if needed)
 #[derive(Debug, Clone)]
 pub struct ChunkPacketView {
     pub chunk_id: u64,
     pub byte_offset: u64,
-    pub chunk_length: u32,
-    pub checksum: Vec<u8>,
+    pub chunk_length: u32,  // Decompressed size
+    pub checksum: Vec<u8>,  // Hash of original (decompressed) data
     pub end_of_file: bool,
-    pub data: Vec<u8>,
+    pub data: Vec<u8>,      // Decompressed data
 }
 
 impl ChunkPacketView {

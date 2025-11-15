@@ -17,7 +17,13 @@ pub struct ChunkPacket {
     /// Flag indicating this is the last chunk of the file
     #[prost(bool, tag = "5")]
     pub end_of_file: bool,
-    /// The actual chunk data payload
+    /// The actual chunk data payload (may be compressed)
     #[prost(bytes = "vec", tag = "6")]
     pub data: ::prost::alloc::vec::Vec<u8>,
+    /// Compression type used (0=None, 1=LZ4, 2=LZ4-HC, 3=Zstd)
+    #[prost(uint32, tag = "7")]
+    pub compression_type: u32,
+    /// Original (uncompressed) size of the chunk data
+    #[prost(uint32, tag = "8")]
+    pub original_size: u32,
 }

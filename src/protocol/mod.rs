@@ -3,6 +3,7 @@
 pub mod chunk;
 pub mod codec;
 pub mod control;
+pub mod hash_check;
 pub mod manifest;
 pub mod messages;
 pub mod resume;
@@ -11,7 +12,11 @@ pub mod status;
 
 pub use chunk::{ChunkPacketBuilder, ChunkPacketParser, ChunkPacketView};
 pub use control::{ControlMessage, ControlMessageType};
+pub use hash_check::{
+    HashCheckRequestSender, HashCheckRequestReceiver,
+    HashCheckResponseSender, HashCheckResponseReceiver,
+};
 pub use messages::{
     SessionStart, Manifest, ChunkPacket, ResumeRequest, ResumeResponse,
-    StatusUpdate, TransferComplete, TransferState,
+    StatusUpdate, TransferComplete, TransferState, HashCheckRequest, HashCheckResponse,
 };

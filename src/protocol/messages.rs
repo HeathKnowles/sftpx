@@ -234,6 +234,34 @@ pub struct TransferComplete {
     pub error: Option<String>,
 }
 
+/// Request to check which chunk hashes already exist (deduplication)
+#[derive(Clone, PartialEq, Message)]
+pub struct HashCheckRequest {
+    /// Session ID
+    #[prost(string, tag = "1")]
+    pub session_id: String,
+    
+    /// List of chunk hashes (BLAKE3) to check
+    #[prost(bytes, repeated, tag = "2")]
+    pub chunk_hashes: Vec<Vec<u8>>,
+}
+
+/// Response indicating which hashes exist
+#[derive(Clone, PartialEq, Message)]
+pub struct HashCheckResponse {
+    /// Session ID
+    #[prost(string, tag = "1")]
+    pub session_id: String,
+    
+    /// List of hashes that already exist on the server
+    #[prost(bytes, repeated, tag = "2")]
+    pub existing_hashes: Vec<Vec<u8>>,
+    
+    /// Bitmap indicating which chunks exist (for efficiency)
+    #[prost(bytes, optional, tag = "3")]
+    pub existing_bitmap: Option<Vec<u8>>,
+}
+
 /// Transfer state enumeration
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
 #[repr(i32)]

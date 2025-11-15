@@ -32,6 +32,13 @@ clap = { version = "4.5", features = ["derive"] }
 # Progress bars
 indicatif = "0.17"
 
+# Compression
+lz4 = "1.28"
+zstd = "0.13"
+
+# Utilities
+hex = "0.4"
+
 # Async runtime (optional, for future async implementation)
 # tokio = { version = "1", features = ["full"] }
 
