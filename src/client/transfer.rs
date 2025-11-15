@@ -768,35 +768,51 @@ impl Transfer {
         
         info!("Client: hash check request prepared: {} bytes", send_result);
         
-        // Actively flush and receive to ensure request is sent and ACKed
-        let mut flush_iterations = 0;
-        while flush_iterations < 50 {
-            // Send outgoing packets
+        // Actively flush and receive to ensure ALL data is sent
+        // The stream_send call buffers data, we need to send packets until buffer is empty
+        let mut consecutive_no_send = 0;
+        const MAX_NO_SEND: usize = 100;  // More iterations to ensure large messages are sent
+        
+        while consecutive_no_send < MAX_NO_SEND {
+            // Send outgoing packets - keep sending until no more packets
             let mut sent_any = false;
-            while let Ok((write, send_info)) = connection.send(out) {
-                socket.send_to(&out[..write], send_info.to)?;
-                sent_any = true;
-                debug!("Client: sent {} bytes during hash check flush", write);
+            loop {
+                match connection.send(out) {
+                    Ok((write, send_info)) => {
+                        if write > 0 {
+                            socket.send_to(&out[..write], send_info.to)?;
+                            sent_any = true;
+                            consecutive_no_send = 0;
+                            debug!("Client: sent {} bytes during hash check flush", write);
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
             
-            // Receive to process ACKs
+            // Receive to process ACKs and window updates
             match socket.recv_from(buf) {
                 Ok((len, from)) => {
                     let recv_info = quiche::RecvInfo {
                         to: local_addr,
                         from,
                     };
-                    let _ = connection.recv(&mut buf[..len], recv_info);
-                    debug!("Client: received {} bytes during hash check flush", len);
+                    if let Ok(read) = connection.recv(&mut buf[..len], recv_info) {
+                        if read > 0 {
+                            debug!("Client: received {} bytes during hash check flush", len);
+                            consecutive_no_send = 0;  // Reset on receive too
+                        }
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => warn!("Client: recv error during hash check flush: {}", e),
+                Err(e) => {
+                    // Don't warn on every timeout, just debug
+                    debug!("Client: recv error during hash check flush: {}", e);
+                }
             }
             
             if !sent_any {
-                flush_iterations += 1;
-            } else {
-                flush_iterations = 0;
+                consecutive_no_send += 1;
             }
             
             std::thread::sleep(Duration::from_millis(10));
