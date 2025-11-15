@@ -6,4 +6,4 @@ pub mod table;
 pub use chunker::{FileChunker, ChunkIterator};
 pub use hasher::ChunkHasher;
 pub use bitmap::ChunkBitmap;
-pub use table::ChunkTable;
+pub use table::{ChunkTable, ChunkMetadata};
