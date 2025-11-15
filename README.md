@@ -1,4 +1,1 @@
-# SFTPX
-
-Smart File Transfer Protcol Extended
-
+# sftpx - QUIC-based file transfer system

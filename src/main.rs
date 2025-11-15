@@ -1,3 +1,1 @@
-fn main() {
-    println!("Hello, world!");
-}
+// Main entry point for the application

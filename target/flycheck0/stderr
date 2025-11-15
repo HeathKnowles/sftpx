@@ -1,0 +1,4 @@
+error: failed to parse manifest at `/home/heathknowles/Documents/Code/Rust/sftpx/Cargo.toml`
+
+Caused by:
+  manifest is missing either a `[package]` or a `[workspace]`
