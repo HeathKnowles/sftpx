@@ -713,79 +713,19 @@ impl Transfer {
             
             // Send length prefix (4 bytes, big-endian)
             let len_bytes = (chunk_packet.len() as u32).to_be_bytes();
-            let mut prefix_written = 0;
-            while prefix_written < 4 {
-                match connection.stream_send(STREAM_DATA, &len_bytes[prefix_written..], false) {
-                    Ok(w) => prefix_written += w,
-                    Err(ref e) if format!("{:?}", e).contains("Done") => {
-                        // Flush packets
-                        while let Ok((len, send_info)) = connection.send(out) {
-                            socket.send_to(&out[..len], send_info.to)?;
-                        }
-                        // Receive ACKs multiple times to free flow control
-                        socket.set_read_timeout(Some(Duration::from_millis(5)))?;
-                        for _ in 0..5 {
-                            if let Ok((len, from)) = socket.recv_from(buf) {
-                                let recv_info = quiche::RecvInfo { from, to: local_addr };
-                                let _ = connection.recv(&mut buf[..len], recv_info);
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(Error::from(e)),
-                }
-            }
+            self.send_data_with_flow_control(
+                connection, socket, buf, out, local_addr,
+                STREAM_DATA, &len_bytes, false
+            )?;
             
             // Send chunk packet data
-            let mut written = 0;
-            while written < chunk_packet.len() {
-                match connection.stream_send(STREAM_DATA, &chunk_packet[written..], is_last && written >= chunk_packet.len()) {
-                    Ok(w) => {
-                        written += w;
-                    }
-                    Err(ref e) if format!("{:?}", e).contains("Done") => {
-                        // Stream buffer full, flush immediately
-                        while let Ok((len, send_info)) = connection.send(out) {
-                            socket.send_to(&out[..len], send_info.to)?;
-                        }
-                        
-                        // Receive ACKs multiple times to free up flow control
-                        socket.set_read_timeout(Some(Duration::from_millis(5)))?;
-                        for _ in 0..5 {
-                            if let Ok((len, from)) = socket.recv_from(buf) {
-                                let recv_info = quiche::RecvInfo { from, to: local_addr };
-                                let _ = connection.recv(&mut buf[..len], recv_info);
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        
-                        // Retry
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Client: failed to send chunk {}: {:?}", chunk_count, e);
-                        return Err(Error::from(e));
-                    }
-                }
-            }
+            self.send_data_with_flow_control(
+                connection, socket, buf, out, local_addr,
+                STREAM_DATA, &chunk_packet, is_last
+            )?;
             
             bytes_sent += chunk_packet.len() as u64;
             chunk_count += 1;
-            
-            // Flush after each chunk
-            while let Ok((len, send_info)) = connection.send(out) {
-                socket.send_to(&out[..len], send_info.to)?;
-            }
-            
-            // Receive ACKs periodically
-            if chunk_count % 3 == 0 {
-                socket.set_read_timeout(Some(Duration::from_millis(1)))?;
-                if let Ok((len, from)) = socket.recv_from(buf) {
-                    let recv_info = quiche::RecvInfo { from, to: local_addr };
-                    let _ = connection.recv(&mut buf[..len], recv_info);
-                }
-            }
             
             if chunk_count % 5 == 0 || is_last {
                 info!("Client: sent chunk {}/{} ({:.1}%)", 
@@ -828,6 +768,65 @@ impl Transfer {
         
         info!("Client: file upload complete ({} bytes sent)", bytes_sent);
         Ok(bytes_sent)
+    }
+    
+    /// Helper: Send data with flow control handling
+    fn send_data_with_flow_control(
+        &self,
+        connection: &mut ClientConnection,
+        socket: &UdpSocket,
+        buf: &mut [u8],
+        out: &mut [u8],
+        local_addr: std::net::SocketAddr,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<()> {
+        let mut written = 0;
+        let max_retries = 100;
+        let mut retry_count = 0;
+        
+        while written < data.len() {
+            // Check if stream is writable
+            let is_writable = connection.writable().any(|id| id == stream_id);
+            
+            if is_writable {
+                match connection.stream_send(stream_id, &data[written..], fin && written >= data.len()) {
+                    Ok(w) => {
+                        written += w;
+                        retry_count = 0; // Reset retry count on success
+                    }
+                    Err(ref e) if format!("{:?}", e).contains("Done") => {
+                        // Stream not ready, continue to flush/receive below
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            
+            // Flush packets
+            while let Ok((len, send_info)) = connection.send(out) {
+                socket.send_to(&out[..len], send_info.to)?;
+            }
+            
+            // Receive ACKs
+            socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+            if let Ok((len, from)) = socket.recv_from(buf) {
+                let recv_info = quiche::RecvInfo { from, to: local_addr };
+                let _ = connection.recv(&mut buf[..len], recv_info);
+            }
+            
+            if written < data.len() {
+                retry_count += 1;
+                if retry_count >= max_retries {
+                    return Err(Error::Protocol(format!(
+                        "Flow control stall: failed to send after {} retries", max_retries
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        
+        Ok(())
     }
     
     pub fn session(&self) -> Option<&ClientSession> {

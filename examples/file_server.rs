@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create server configuration
     let config = ServerConfig {
-        bind_addr: "127.0.0.1:4443".to_string(),
+        bind_addr: "0.0.0.0:4443".to_string(),  // Bind to all interfaces for remote access
         cert_path: "certs/cert.pem".to_string(),
         key_path: "certs/key.pem".to_string(),
         max_idle_timeout: 30000, // 30 seconds
