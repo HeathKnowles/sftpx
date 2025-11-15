@@ -275,11 +275,12 @@ impl TransferManager {
         let mut stream_buffer = Vec::new(); // Accumulate stream data
         let mut chunk_buffer = vec![0u8; 65535];
         let receive_timeout = Duration::from_secs(30);
-        let receive_start = Instant::now();
+        let mut last_activity = Instant::now();
         let mut last_progress = 0.0;
         let mut chunks_received = 0u64;
         let mut expecting_length = true;
         let mut expected_chunk_size = 0usize;
+        let mut received_last_chunk = false;
         
         loop {
             // Receive network packets first
@@ -294,6 +295,7 @@ impl TransferManager {
             match connection.stream_recv(data_stream, &mut chunk_buffer) {
                 Ok((read, fin)) => {
                     if read > 0 {
+                        last_activity = Instant::now(); // Reset activity timer on data
                         stream_buffer.extend_from_slice(&chunk_buffer[..read]);
                         
                         // Process complete messages with length framing
@@ -316,10 +318,17 @@ impl TransferManager {
                                 // Extract and process chunk
                                 let chunk_data: Vec<u8> = stream_buffer.drain(0..expected_chunk_size).collect();
                                 match receiver.receive_chunk(&chunk_data) {
-                                    Ok(_chunk) => {
+                                    Ok(chunk) => {
                                         chunks_received += 1;
+                                        
+                                        // Check if this is the last chunk
+                                        if chunk.end_of_file {
+                                            log::info!("Server: received last chunk (EOF marker)");
+                                            received_last_chunk = true;
+                                        }
+                                        
                                         let progress = receiver.progress();
-                                        if chunks_received % 5 == 0 || progress - last_progress > 0.1 {
+                                        if chunks_received % 5 == 0 || progress - last_progress > 0.1 || chunk.end_of_file {
                                             log::info!("Server: received chunk {}/{} ({:.1}%)", 
                                                 chunks_received, manifest.total_chunks, progress * 100.0);
                                             last_progress = progress;
@@ -338,16 +347,25 @@ impl TransferManager {
                         log::info!("Server: received FIN on data stream");
                         break;
                     }
+                    
+                    // Exit if we received the last chunk with EOF marker
+                    if received_last_chunk && receiver.is_complete() {
+                        log::info!("Server: received all chunks including EOF marker");
+                        break;
+                    }
                 }
                 Err(quiche::Error::Done) => {
                     // No data available, check if complete
-                    if receiver.is_complete() {
-                        log::info!("Server: all chunks received!");
+                    if received_last_chunk && receiver.is_complete() {
+                        log::info!("Server: all chunks received with EOF!");
                         break;
                     }
                     
-                    if receive_start.elapsed() > receive_timeout {
-                        return Err("File receive timeout".into());
+                    // Only timeout if no activity (data stopped flowing)
+                    if last_activity.elapsed() > receive_timeout {
+                        log::warn!("Server: no activity for {} seconds, chunks: {}/{}",
+                            receive_timeout.as_secs(), chunks_received, manifest.total_chunks);
+                        return Err("File receive timeout - no activity".into());
                     }
                     
                     std::thread::sleep(Duration::from_millis(10));
@@ -355,7 +373,7 @@ impl TransferManager {
                 }
                 Err(quiche::Error::InvalidStreamState(_)) => {
                     // Stream not ready yet, wait for data
-                    if receive_start.elapsed() > receive_timeout {
+                    if last_activity.elapsed() > receive_timeout {
                         return Err("File receive timeout waiting for stream".into());
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -366,14 +384,10 @@ impl TransferManager {
                 }
             }
             
-            // Check if complete
-            if receiver.is_complete() {
-                log::info!("Server: all chunks received!");
+            // Check if complete with EOF marker
+            if received_last_chunk && receiver.is_complete() {
+                log::info!("Server: all chunks received with EOF marker!");
                 break;
-            }
-            
-            if receive_start.elapsed() > receive_timeout {
-                return Err("File receive timeout".into());
             }
         }
         
