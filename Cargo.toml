@@ -1,1 +1,4 @@
-# Cargo.toml - Main project manifest
+[package]
+name = "sftpx"
+version = "0.1.0"
+edition = "2024"
