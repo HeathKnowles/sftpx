@@ -57,7 +57,7 @@ impl Server {
         println!("Server listening on {}", config.bind_addr);
 
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)?;
-        quic_config.set_application_protos(&[b"hq-29"])?;
+        quic_config.set_application_protos(&[b"sftpx/0.1"])?;
         quic_config.verify_peer(false);
         quic_config.set_max_idle_timeout(config.max_idle_timeout);
         quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);

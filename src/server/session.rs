@@ -3,8 +3,10 @@
 use super::connection::ServerConnection;
 use super::streams::StreamManager;
 use super::sender::DataSender;
+use super::transfer::TransferManager;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
+use std::path::PathBuf;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -14,7 +16,9 @@ pub struct ServerSession<'a> {
     connection: &'a mut ServerConnection,
     stream_manager: StreamManager,
     data_sender: DataSender,
-    message_sent: bool,
+    transfer_manager: TransferManager,
+    upload_received: bool,
+    processing_upload: bool,
 }
 
 impl<'a> ServerSession<'a> {
@@ -24,7 +28,9 @@ impl<'a> ServerSession<'a> {
             connection,
             stream_manager: StreamManager::new(),
             data_sender: DataSender::new(),
-            message_sent: false,
+            transfer_manager: TransferManager::new(),
+            upload_received: false,
+            processing_upload: false,
         }
     }
 
@@ -113,13 +119,13 @@ impl<'a> ServerSession<'a> {
             }
 
             // Process readable streams
-            self.process_readable_streams(buf)?;
+            self.process_readable_streams(socket, buf)?;
 
             // Send any pending packets
             self.connection.send_packets(socket, out)?;
 
-            // Exit if message was sent and flushed
-            if self.message_sent {
+            // Exit if upload was received and processed
+            if self.upload_received {
                 std::thread::sleep(Duration::from_millis(100));
                 break;
             }
@@ -129,10 +135,10 @@ impl<'a> ServerSession<'a> {
 
         socket.set_nonblocking(false)?;
 
-        if self.message_sent {
-            println!("Message sent, closing server.");
+        if self.upload_received {
+            println!("✅ Upload received successfully, closing connection.");
         } else {
-            println!("Timeout reached, no client message received. Closing server.");
+            println!("Timeout reached, no upload received. Closing connection.");
         }
 
         Ok(())
@@ -141,6 +147,7 @@ impl<'a> ServerSession<'a> {
     /// Process all readable streams
     fn process_readable_streams(
         &mut self,
+        socket: &UdpSocket,
         buf: &mut [u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let readable: Vec<u64> = self.connection.readable().collect();
@@ -149,6 +156,44 @@ impl<'a> ServerSession<'a> {
             println!("Server: conn.readable() -> {:?}", readable);
         }
 
+        // Check if this looks like a file upload (manifest on stream 4)
+        // Process the upload once when we see manifest stream
+        if readable.contains(&4) && !self.processing_upload && !self.upload_received {
+            println!("Server: detected file upload (manifest ready), starting integrated receive...");
+            self.processing_upload = true;
+            
+            // Use integrated file receive
+            let upload_dir = PathBuf::from("./uploads");
+            std::fs::create_dir_all(&upload_dir)?;
+            
+            match self.transfer_manager.receive_file_integrated(
+                self.connection,
+                socket,
+                &upload_dir,
+                4, // STREAM_MANIFEST (client-initiated bidirectional stream 1)
+                8, // STREAM_DATA (client-initiated bidirectional stream 2)
+            ) {
+                Ok((file_path, bytes)) => {
+                    println!("\n✅ File upload successful!");
+                    println!("  File saved to: {:?}", file_path);
+                    println!("  Total bytes: {} ({:.2} MB)", bytes, bytes as f64 / 1_048_576.0);
+                    self.upload_received = true;
+                }
+                Err(e) => {
+                    eprintln!("❌ File upload failed: {:?}", e);
+                    self.processing_upload = false;
+                }
+            }
+            
+            return Ok(());
+        }
+        
+        // Skip stream processing if we're handling an upload
+        if self.processing_upload || self.upload_received {
+            return Ok(());
+        }
+
+        // Process other streams normally
         for stream_id in readable {
             self.handle_stream_data(stream_id, buf)?;
         }
@@ -162,6 +207,7 @@ impl<'a> ServerSession<'a> {
         stream_id: u64,
         buf: &mut [u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Handle regular stream data (for backward compatibility)
         loop {
             match self.connection.stream_recv(stream_id, buf) {
                 Ok((read, fin)) => {
@@ -180,7 +226,7 @@ impl<'a> ServerSession<'a> {
                         reply,
                         fin,
                     )?;
-                    self.message_sent = true;
+                    self.upload_received = true;
 
                     if fin {
                         break;

@@ -3,13 +3,15 @@
 mod connection;
 mod streams;
 mod session;
-mod receiver;
-mod transfer;
+pub mod receiver;
+mod sender;
+pub mod transfer;
 
 pub use connection::ClientConnection;
 pub use streams::{StreamManager, StreamType};
 pub use session::ClientSession;
 pub use receiver::FileReceiver;
+pub use sender::DataSender;
 pub use transfer::Transfer;
 
 use crate::common::error::Result;

@@ -70,9 +70,9 @@ fn test_stream_manager() {
     
     // Test stream type IDs
     assert_eq!(StreamType::Control.stream_id(), 0);
-    assert_eq!(StreamType::Data1.stream_id(), 4);
-    assert_eq!(StreamType::Data2.stream_id(), 8);
-    assert_eq!(StreamType::Data3.stream_id(), 12);
+    assert_eq!(StreamType::Manifest.stream_id(), 4);
+    assert_eq!(StreamType::Data.stream_id(), 8);
+    assert_eq!(StreamType::Status.stream_id(), 12);
     
     // Test all streams
     let all_streams = StreamType::all();
@@ -94,7 +94,7 @@ fn test_data_sender() {
     assert_eq!(sender.total_bytes_sent(), 0);
     
     let mut sender = DataSender::default();
-    sender.reset_counter();
+    sender.reset_counters();
     assert_eq!(sender.total_bytes_sent(), 0);
 }
 

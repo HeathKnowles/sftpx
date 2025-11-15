@@ -4,8 +4,8 @@ pub mod server;
 pub mod protocol;
 pub mod proto;
 pub mod chunking;
-// pub mod transport;  // Uncomment when transport is implemented
-// pub mod storage;  // Uncomment when storage is implemented
+pub mod transport;
+pub mod storage;
 pub mod logging;
 pub mod resumption;
 pub mod retransmission;

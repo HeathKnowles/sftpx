@@ -7,6 +7,28 @@ use std::collections::HashSet;
 use crate::common::error::{Error, Result};
 use crate::common::types::ChunkId;
 use crate::protocol::chunk::{ChunkPacketParser, ChunkPacketView};
+use crate::retransmission::missing::MissingChunkTracker;
+use crate::protocol::control::ControlMessage;
+
+/// Synchronization mode for chunk writes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Only flush to OS buffers (fastest, least durable)
+    FlushOnly,
+    /// Full fsync after each chunk (slowest, most durable)
+    SyncAll,
+    /// Sync every N chunks (balanced)
+    SyncEvery(u64),
+}
+
+impl Default for SyncMode {
+    fn default() -> Self {
+        SyncMode::FlushOnly
+    }
+}
+
+/// Callback type for sending control messages
+pub type ControlMessageSender = Box<dyn Fn(ControlMessage) -> Result<()> + Send>;
 
 /// File receiver for assembling chunks into a complete file
 pub struct FileReceiver {
@@ -18,16 +40,43 @@ pub struct FileReceiver {
     total_chunks: u64,
     bytes_received: u64,
     end_of_file_received: bool,
+    sync_mode: SyncMode,
+    finalized: bool,
+    expected_file_hash: Option<Vec<u8>>,
+    /// Session ID for control messages
+    session_id: String,
+    /// Missing chunk tracker for automatic retransmission
+    missing_tracker: Option<MissingChunkTracker>,
+    /// Control message sender (optional, for automatic re-request)
+    control_sender: Option<ControlMessageSender>,
+    /// Enable automatic retransmission on corruption
+    auto_retransmit: bool,
 }
 
 impl FileReceiver {
-    /// Create a new file receiver
+    /// Create a new file receiver with default sync mode (FlushOnly)
     /// 
     /// # Arguments
     /// * `output_dir` - Directory to save the file to
     /// * `filename` - Name of the output file
     /// * `file_size` - Expected total file size in bytes
     pub fn new(output_dir: &Path, filename: &str, file_size: u64) -> Result<Self> {
+        Self::with_sync_mode(output_dir, filename, file_size, SyncMode::default())
+    }
+    
+    /// Create a new file receiver with specified sync mode
+    /// 
+    /// # Arguments
+    /// * `output_dir` - Directory to save the file to
+    /// * `filename` - Name of the output file
+    /// * `file_size` - Expected total file size in bytes
+    /// * `sync_mode` - Synchronization mode for chunk writes
+    pub fn with_sync_mode(
+        output_dir: &Path,
+        filename: &str,
+        file_size: u64,
+        sync_mode: SyncMode,
+    ) -> Result<Self> {
         let final_file_path = output_dir.join(filename);
         let part_file_path = output_dir.join(format!("{}.part", filename));
         
@@ -52,7 +101,41 @@ impl FileReceiver {
             total_chunks: 0,
             bytes_received: 0,
             end_of_file_received: false,
+            sync_mode,
+            finalized: false,
+            expected_file_hash: None,
+            session_id: String::new(),
+            missing_tracker: None,
+            control_sender: None,
+            auto_retransmit: false,
         })
+    }
+    
+    /// Enable automatic retransmission on corruption
+    /// 
+    /// # Arguments
+    /// * `session_id` - Session ID for control messages
+    /// * `control_sender` - Callback to send control messages
+    pub fn enable_auto_retransmit(
+        &mut self,
+        session_id: String,
+        control_sender: ControlMessageSender,
+    ) {
+        self.session_id = session_id;
+        self.control_sender = Some(control_sender);
+        self.auto_retransmit = true;
+        
+        // Initialize missing tracker if we know total chunks
+        if self.total_chunks > 0 && self.missing_tracker.is_none() {
+            self.missing_tracker = Some(MissingChunkTracker::new(self.total_chunks));
+        }
+    }
+    
+    /// Disable automatic retransmission
+    pub fn disable_auto_retransmit(&mut self) {
+        self.auto_retransmit = false;
+        self.missing_tracker = None;
+        self.control_sender = None;
     }
     
     /// Receive and process a chunk packet
@@ -76,7 +159,32 @@ impl FileReceiver {
         }
         
         // Verify checksum
-        chunk.verify_checksum()?;
+        if let Err(e) = chunk.verify_checksum() {
+            log::error!("Chunk {} failed checksum verification: {:?}", chunk.chunk_id, e);
+            
+            // If auto-retransmit is enabled, send NACK and request retransmission
+            if self.auto_retransmit {
+                if let Some(tracker) = &mut self.missing_tracker {
+                    tracker.mark_corrupted(chunk.chunk_id);
+                }
+                
+                if let Some(sender) = &self.control_sender {
+                    let nack = ControlMessage::nack(
+                        self.session_id.clone(),
+                        vec![chunk.chunk_id],
+                        Some(format!("Checksum verification failed: {:?}", e)),
+                    );
+                    
+                    if let Err(send_err) = sender(nack) {
+                        log::error!("Failed to send NACK for chunk {}: {:?}", chunk.chunk_id, send_err);
+                    } else {
+                        log::info!("Sent NACK for corrupted chunk {}, will auto-retry", chunk.chunk_id);
+                    }
+                }
+            }
+            
+            return Err(e);
+        }
         
         // Check for duplicate
         if self.received_chunks.contains(&chunk.chunk_id) {
@@ -87,15 +195,47 @@ impl FileReceiver {
         // Write chunk to file at correct offset
         self.part_file.seek(SeekFrom::Start(chunk.byte_offset))?;
         self.part_file.write_all(&chunk.data)?;
-        self.part_file.flush()?;
+        
+        // Sync based on configured mode
+        match self.sync_mode {
+            SyncMode::FlushOnly => {
+                self.part_file.flush()?;
+            }
+            SyncMode::SyncAll => {
+                self.part_file.flush()?;
+                self.part_file.sync_all()?;
+            }
+            SyncMode::SyncEvery(n) => {
+                self.part_file.flush()?;
+                if (chunk.chunk_id + 1) % n == 0 {
+                    self.part_file.sync_all()?;
+                }
+            }
+        }
         
         // Update tracking
         self.received_chunks.insert(chunk.chunk_id);
         self.bytes_received += chunk.data.len() as u64;
         
+        // Mark as successfully received in tracker
+        if let Some(tracker) = &mut self.missing_tracker {
+            tracker.mark_received(chunk.chunk_id);
+        }
+        
         if chunk.end_of_file {
             self.end_of_file_received = true;
             self.total_chunks = chunk.chunk_id + 1;
+            
+            // Initialize tracker now that we know total chunks
+            if self.auto_retransmit && self.missing_tracker.is_none() {
+                self.missing_tracker = Some(MissingChunkTracker::new(self.total_chunks));
+                // Mark all already-received chunks
+                if let Some(tracker) = &mut self.missing_tracker {
+                    for &chunk_id in &self.received_chunks {
+                        tracker.mark_received(chunk_id);
+                    }
+                }
+            }
             
             log::info!(
                 "Received final chunk {} of {} (EOF)",
@@ -146,6 +286,120 @@ impl FileReceiver {
             .collect()
     }
     
+    /// Request retransmission of missing chunks (if auto-retransmit is enabled)
+    /// 
+    /// # Arguments
+    /// * `batch_size` - Maximum number of chunks to request at once
+    /// 
+    /// # Returns
+    /// Number of chunks requested, or 0 if auto-retransmit is disabled
+    pub fn request_missing_chunks(&mut self, batch_size: usize) -> Result<usize> {
+        if !self.auto_retransmit {
+            return Ok(0);
+        }
+        
+        let tracker = self.missing_tracker.as_mut().ok_or_else(|| {
+            Error::Protocol("Missing chunk tracker not initialized".to_string())
+        })?;
+        
+        let sender = self.control_sender.as_ref().ok_or_else(|| {
+            Error::Protocol("Control sender not set".to_string())
+        })?;
+        
+        // Get all missing chunks and mark them as needing retransmission
+        let all_missing = tracker.get_missing();
+        for chunk_id in &all_missing {
+            tracker.mark_corrupted(*chunk_id);
+        }
+        
+        // Get next batch of chunks to retry
+        let chunk_ids = tracker.get_next_batch(batch_size);
+        
+        if chunk_ids.is_empty() {
+            return Ok(0);
+        }
+        
+        // Send retransmit request
+        let request = ControlMessage::retransmit_request(
+            self.session_id.clone(),
+            chunk_ids.clone(),
+        );
+        
+        sender(request)?;
+        
+        log::info!("Requested retransmission of {} chunks", chunk_ids.len());
+        Ok(chunk_ids.len())
+    }
+    
+    /// Check if any chunks have failed (exceeded max retries)
+    pub fn has_failed_chunks(&self) -> bool {
+        if let Some(tracker) = &self.missing_tracker {
+            tracker.has_failed()
+        } else {
+            false
+        }
+    }
+    
+    /// Get list of chunks that have exceeded max retries
+    pub fn get_failed_chunks(&self) -> Vec<ChunkId> {
+        if let Some(tracker) = &self.missing_tracker {
+            tracker.get_failed_chunks()
+        } else {
+            Vec::new()
+        }
+    }
+    
+    /// Set the expected file hash for verification
+    /// This should be called with the hash from the manifest
+    pub fn set_expected_hash(&mut self, hash: Vec<u8>) -> Result<()> {
+        if hash.len() != 32 {
+            return Err(Error::Protocol(format!(
+                "Invalid hash size: {} (expected 32 bytes for BLAKE3)",
+                hash.len()
+            )));
+        }
+        self.expected_file_hash = Some(hash);
+        Ok(())
+    }
+    
+    /// Verify the complete file hash matches the expected hash
+    /// This performs end-to-end integrity verification
+    pub fn verify_file_hash(&mut self) -> Result<()> {
+        let expected_hash = self.expected_file_hash.as_ref().ok_or_else(|| {
+            Error::Protocol("No expected file hash set".to_string())
+        })?;
+        
+        // Compute hash of the complete file
+        self.part_file.seek(SeekFrom::Start(0))?;
+        
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 65536]; // 64KB buffer
+        
+        loop {
+            let bytes_read = std::io::Read::read(&mut self.part_file, &mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        
+        let computed_hash = hasher.finalize();
+        
+        if computed_hash.as_bytes() != expected_hash.as_slice() {
+            return Err(Error::HashMismatch {
+                expected: expected_hash.clone(),
+                actual: computed_hash.as_bytes().to_vec(),
+            });
+        }
+        
+        log::info!(
+            "File hash verification successful: {:02x?}",
+            &computed_hash.as_bytes()[..8]
+        );
+        
+        Ok(())
+    }
+    
     /// Finalize the transfer
     /// This verifies completeness and atomically renames the .part file
     pub fn finalize(&mut self) -> Result<PathBuf> {
@@ -156,6 +410,11 @@ impl FileReceiver {
                 missing.len(),
                 &missing[..missing.len().min(10)]
             )));
+        }
+        
+        // Verify file hash if expected hash is set
+        if self.expected_file_hash.is_some() {
+            self.verify_file_hash()?;
         }
         
         // Flush and sync
@@ -170,6 +429,9 @@ impl FileReceiver {
         
         // Atomic rename
         std::fs::rename(&self.part_file_path, &self.final_file_path)?;
+        
+        // Mark as finalized so Drop won't clean up
+        self.finalized = true;
         
         log::info!(
             "Transfer finalized: {} ({} bytes, {} chunks)",
@@ -189,6 +451,57 @@ impl FileReceiver {
             total_chunks: self.total_chunks,
             is_complete: self.is_complete(),
             progress: self.progress(),
+        }
+    }
+    
+    /// Abort the transfer and clean up the partial file
+    /// This is useful when explicitly canceling a transfer
+    pub fn abort(mut self) -> Result<()> {
+        self.cleanup()
+    }
+    
+    /// Clean up the partial file (internal method)
+    fn cleanup(&mut self) -> Result<()> {
+        if self.finalized {
+            return Ok(()); // Already finalized, nothing to clean up
+        }
+        
+        // Close the file first
+        drop(std::mem::replace(
+            &mut self.part_file,
+            OpenOptions::new().write(true).open("/dev/null")?
+        ));
+        
+        // Remove the .part file if it exists
+        if self.part_file_path.exists() {
+            match std::fs::remove_file(&self.part_file_path) {
+                Ok(_) => {
+                    log::info!("Cleaned up partial file: {}", self.part_file_path.display());
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to remove partial file {}: {}",
+                        self.part_file_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        
+        self.finalized = true; // Mark as cleaned up
+        Ok(())
+    }
+}
+
+/// Automatically clean up partial file on drop if not finalized
+impl Drop for FileReceiver {
+    fn drop(&mut self) {
+        if !self.finalized {
+            log::warn!(
+                "FileReceiver dropped without finalization, cleaning up partial file: {}",
+                self.part_file_path.display()
+            );
+            let _ = self.cleanup();
         }
     }
 }
@@ -217,6 +530,20 @@ mod tests {
         assert_eq!(receiver.file_size, 1024);
         assert_eq!(receiver.bytes_received, 0);
         assert!(!receiver.is_complete());
+        assert_eq!(receiver.sync_mode, SyncMode::FlushOnly);
+    }
+    
+    #[test]
+    fn test_receiver_with_sync_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let receiver = FileReceiver::with_sync_mode(
+            temp_dir.path(),
+            "test.dat",
+            1024,
+            SyncMode::SyncAll
+        ).unwrap();
+        
+        assert_eq!(receiver.sync_mode, SyncMode::SyncAll);
     }
 
     #[test]
@@ -273,5 +600,350 @@ mod tests {
         
         assert!(receiver.is_complete());
         assert_eq!(receiver.received_chunks.len(), 2);
+    }
+    
+    #[test]
+    fn test_cleanup_on_drop() {
+        let temp_dir = TempDir::new().unwrap();
+        let part_file_path = temp_dir.path().join("test.dat.part");
+        
+        {
+            let _receiver = FileReceiver::new(temp_dir.path(), "test.dat", 100).unwrap();
+            // Receiver dropped without finalization
+            assert!(part_file_path.exists());
+        }
+        
+        // .part file should be cleaned up
+        assert!(!part_file_path.exists());
+    }
+    
+    #[test]
+    fn test_explicit_abort() {
+        let temp_dir = TempDir::new().unwrap();
+        let part_file_path = temp_dir.path().join("test.dat.part");
+        
+        let receiver = FileReceiver::new(temp_dir.path(), "test.dat", 100).unwrap();
+        assert!(part_file_path.exists());
+        
+        // Explicitly abort
+        receiver.abort().unwrap();
+        
+        // .part file should be removed
+        assert!(!part_file_path.exists());
+    }
+    
+    #[test]
+    fn test_no_cleanup_after_finalize() {
+        let temp_dir = TempDir::new().unwrap();
+        let final_file_path = temp_dir.path().join("test.dat");
+        let part_file_path = temp_dir.path().join("test.dat.part");
+        
+        let mut receiver = FileReceiver::new(temp_dir.path(), "test.dat", 20).unwrap();
+        
+        // Send a complete chunk
+        let mut builder = ChunkPacketBuilder::new();
+        let data = b"Hello, World!";
+        let checksum = blake3::hash(data);
+        
+        let packet = builder.build(
+            0,
+            0,
+            data.len() as u32,
+            checksum.as_bytes(),
+            true,
+            data
+        ).unwrap();
+        
+        receiver.receive_chunk(&packet).unwrap();
+        receiver.finalize().unwrap();
+        
+        // Final file should exist, part file should not
+        assert!(final_file_path.exists());
+        assert!(!part_file_path.exists());
+        
+        // Drop should not try to clean up again
+        drop(receiver);
+        assert!(final_file_path.exists());
+    }
+    
+    #[test]
+    fn test_sync_modes() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut builder = ChunkPacketBuilder::new();
+        
+        // Test FlushOnly mode
+        let mut receiver = FileReceiver::with_sync_mode(
+            temp_dir.path(),
+            "flush.dat",
+            100,
+            SyncMode::FlushOnly
+        ).unwrap();
+        
+        let data = b"test";
+        let checksum = blake3::hash(data);
+        let packet = builder.build(0, 0, data.len() as u32, checksum.as_bytes(), false, data).unwrap();
+        receiver.receive_chunk(&packet).unwrap();
+        
+        // Test SyncAll mode
+        let mut receiver = FileReceiver::with_sync_mode(
+            temp_dir.path(),
+            "sync.dat",
+            100,
+            SyncMode::SyncAll
+        ).unwrap();
+        
+        receiver.receive_chunk(&packet).unwrap();
+        
+        // Test SyncEvery mode
+        let mut receiver = FileReceiver::with_sync_mode(
+            temp_dir.path(),
+            "syncevery.dat",
+            100,
+            SyncMode::SyncEvery(5)
+        ).unwrap();
+        
+        receiver.receive_chunk(&packet).unwrap();
+    }
+    
+    #[test]
+    fn test_file_hash_verification_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let data = b"Test data for hash verification";
+        let mut receiver = FileReceiver::new(temp_dir.path(), "test.dat", data.len() as u64).unwrap();
+        
+        // Send a complete chunk
+        let mut builder = ChunkPacketBuilder::new();
+        let checksum = blake3::hash(data);
+        
+        let packet = builder.build(
+            0,
+            0,
+            data.len() as u32,
+            checksum.as_bytes(),
+            true,
+            data
+        ).unwrap();
+        
+        receiver.receive_chunk(&packet).unwrap();
+        
+        // Compute expected file hash
+        let file_hash = blake3::hash(data);
+        receiver.set_expected_hash(file_hash.as_bytes().to_vec()).unwrap();
+        
+        // Finalize should succeed with correct hash
+        let result = receiver.finalize();
+        assert!(result.is_ok());
+    }
+    
+    #[test]
+    fn test_file_hash_verification_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut receiver = FileReceiver::new(temp_dir.path(), "test.dat", 50).unwrap();
+        
+        // Send a complete chunk
+        let mut builder = ChunkPacketBuilder::new();
+        let data = b"Test data";
+        let checksum = blake3::hash(data);
+        
+        let packet = builder.build(
+            0,
+            0,
+            data.len() as u32,
+            checksum.as_bytes(),
+            true,
+            data
+        ).unwrap();
+        
+        receiver.receive_chunk(&packet).unwrap();
+        
+        // Set wrong expected hash
+        let wrong_hash = blake3::hash(b"Wrong data");
+        receiver.set_expected_hash(wrong_hash.as_bytes().to_vec()).unwrap();
+        
+        // Finalize should fail with hash mismatch
+        let result = receiver.finalize();
+        assert!(result.is_err());
+        match result {
+            Err(Error::HashMismatch { .. }) => (),
+            _ => panic!("Expected HashMismatch error"),
+        }
+    }
+    
+    #[test]
+    fn test_set_expected_hash_invalid_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut receiver = FileReceiver::new(temp_dir.path(), "test.dat", 100).unwrap();
+        
+        let invalid_hash = vec![0u8; 16]; // Wrong size
+        let result = receiver.set_expected_hash(invalid_hash);
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_finalize_without_hash_verification() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut receiver = FileReceiver::new(temp_dir.path(), "test.dat", 20).unwrap();
+        
+        // Send complete chunk without setting expected hash
+        let mut builder = ChunkPacketBuilder::new();
+        let data = b"No hash check";
+        let checksum = blake3::hash(data);
+        
+        let packet = builder.build(
+            0,
+            0,
+            data.len() as u32,
+            checksum.as_bytes(),
+            true,
+            data
+        ).unwrap();
+        
+        receiver.receive_chunk(&packet).unwrap();
+        
+        // Should succeed even without hash verification
+        let result = receiver.finalize();
+        assert!(result.is_ok());
+    }
+    
+    #[test]
+    fn test_auto_retransmit_on_corruption() {
+        use std::sync::{Arc, Mutex};
+        
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut receiver = FileReceiver::new(
+            temp_dir.path(),
+            "test.dat",
+            100,
+        ).unwrap();
+        
+        // Track sent control messages
+        let sent_messages = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = sent_messages.clone();
+        
+        // Enable auto-retransmit
+        receiver.enable_auto_retransmit(
+            "test-session".to_string(),
+            Box::new(move |msg| {
+                sent_clone.lock().unwrap().push(msg);
+                Ok(())
+            }),
+        );
+        
+        // Create a chunk with valid checksum
+        let data = vec![1, 2, 3, 4, 5];
+        let checksum = blake3::hash(&data);
+        let mut builder = ChunkPacketBuilder::new();
+        let chunk_bytes = builder.build(
+            0,
+            0,
+            data.len() as u32,
+            checksum.as_bytes(),
+            false,
+            &data,
+        ).unwrap();
+        
+        // Corrupt the checksum by modifying the encoded bytes
+        let mut corrupted_bytes = chunk_bytes.clone();
+        if corrupted_bytes.len() > 10 {
+            corrupted_bytes[10] ^= 0xFF;
+        }
+        
+        // Receiving corrupted chunk should fail and send NACK
+        let result = receiver.receive_chunk(&corrupted_bytes);
+        assert!(result.is_err());
+        
+        // Check that NACK was sent
+        let messages = sent_messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get_type(), crate::protocol::control::ControlMessageType::Nack);
+        assert_eq!(messages[0].chunk_ids, vec![0]);
+    }
+    
+    #[test]
+    fn test_request_missing_chunks() {
+        use std::sync::{Arc, Mutex};
+        
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut receiver = FileReceiver::new(
+            temp_dir.path(),
+            "test.dat",
+            150,
+        ).unwrap();
+        
+        // Track sent control messages
+        let sent_messages = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = sent_messages.clone();
+        
+        // Enable auto-retransmit
+        receiver.enable_auto_retransmit(
+            "test-session".to_string(),
+            Box::new(move |msg| {
+                sent_clone.lock().unwrap().push(msg);
+                Ok(())
+            }),
+        );
+        
+        // Receive chunk 0
+        let data0 = vec![1; 50];
+        let checksum0 = blake3::hash(&data0);
+        let mut builder0 = ChunkPacketBuilder::new();
+        let chunk0_bytes = builder0.build(
+            0,
+            0,
+            data0.len() as u32,
+            checksum0.as_bytes(),
+            false,
+            &data0,
+        ).unwrap();
+        receiver.receive_chunk(&chunk0_bytes).unwrap();
+        
+        // Receive chunk 2 (skip chunk 1)
+        let data2 = vec![3; 50];
+        let checksum2 = blake3::hash(&data2);
+        let mut builder2 = ChunkPacketBuilder::new();
+        let chunk2_bytes = builder2.build(
+            2,
+            100,
+            data2.len() as u32,
+            checksum2.as_bytes(),
+            true,
+            &data2,
+        ).unwrap();
+        receiver.receive_chunk(&chunk2_bytes).unwrap();
+        
+        // Clear previous messages
+        sent_messages.lock().unwrap().clear();
+        
+        // Request missing chunks (chunk 1)
+        let count = receiver.request_missing_chunks(10).unwrap();
+        assert_eq!(count, 1);
+        
+        // Check that retransmit request was sent
+        let messages = sent_messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get_type(), crate::protocol::control::ControlMessageType::RetransmitRequest);
+        assert_eq!(messages[0].chunk_ids, vec![1]);
+    }
+    
+    #[test]
+    fn test_disable_auto_retransmit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut receiver = FileReceiver::new(
+            temp_dir.path(),
+            "test.dat",
+            100,
+        ).unwrap();
+        
+        // Enable then disable
+        receiver.enable_auto_retransmit(
+            "test-session".to_string(),
+            Box::new(|_| Ok(())),
+        );
+        assert!(receiver.auto_retransmit);
+        
+        receiver.disable_auto_retransmit();
+        assert!(!receiver.auto_retransmit);
+        assert!(receiver.missing_tracker.is_none());
+        assert!(receiver.control_sender.is_none());
     }
 }

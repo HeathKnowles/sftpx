@@ -68,4 +68,10 @@ impl From<quiche::Error> for Error {
     }
 }
 
+impl From<prost::DecodeError> for Error {
+    fn from(err: prost::DecodeError) -> Self {
+        Error::DeserializationError(format!("{:?}", err))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
