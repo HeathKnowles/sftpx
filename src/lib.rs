@@ -2,7 +2,7 @@
 
 pub mod common;
 pub mod client;
-// pub mod server;  // Uncomment when server is implemented
+pub mod server;  // Uncomment when server is implemented
 // pub mod protocol;  // Uncomment when protocol is implemented
 // pub mod transport;  // Uncomment when transport is implemented
 // pub mod chunking;  // Uncomment when chunking is implemented
@@ -11,3 +11,5 @@ pub mod client;
 // Re-export commonly used items
 pub use common::{Error, Result, ClientConfig};
 pub use client::Client;
+
+pub use server::{Server, ServerConfig, ServerConnection, ServerSession};

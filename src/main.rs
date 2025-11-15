@@ -2,6 +2,8 @@
 
 use clap::{Parser, Subcommand};
 use sftpx::{Client, ClientConfig, Result};
+use sftpx::server::{Server, ServerConfig};
+
 
 #[derive(Parser)]
 #[command(name = "sftpx")]

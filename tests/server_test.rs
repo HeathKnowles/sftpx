@@ -66,7 +66,7 @@ fn test_server_config_defaults() {
 fn test_stream_manager() {
     use sftpx::server::{StreamManager, StreamType};
     
-    let mut manager = StreamManager::new();
+    let manager = StreamManager::new();
     
     // Test stream type IDs
     assert_eq!(StreamType::Control.stream_id(), 0);
