@@ -1,6 +1,8 @@
 [package]
-name = "sftpx"
+name = "quiche-test"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+quiche = "0.24.6"
+ring = "0.17"
