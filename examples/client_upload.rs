@@ -41,8 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create client configuration
     let server_addr = format!("{}:4443", server_ip).parse()?;
-    let config = ClientConfig::new(server_addr, "localhost".to_string())
-        .disable_cert_verification()
+    let server_name = if server_ip == "127.0.0.1" || server_ip == "localhost" {
+        "localhost".to_string()
+    } else {
+        server_ip.to_string() // Use IP address as server name for remote connections
+    };
+    
+    let config = ClientConfig::new(server_addr, server_name)
+        .disable_cert_verification()  // Skip cert verification for testing
         .with_chunk_size(262144)?; // 256 KB chunks
     
     println!("Client Configuration:");
