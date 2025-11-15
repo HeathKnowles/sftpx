@@ -1,1 +1,0 @@
-// Example: Simple file receive
