@@ -26,8 +26,8 @@ impl Default for ClientConfig {
             max_retries: 3,
             timeout: super::types::DEFAULT_TIMEOUT,
             session_dir: PathBuf::from(".sftpx/sessions"),
-            verify_cert: true,
-            ca_cert_path: None,
+            verify_cert: false, // Default to no verification for easier testing
+            ca_cert_path: Some(PathBuf::from("certs/cert.pem")), // Default cert path
         }
     }
 }
@@ -65,6 +65,22 @@ impl ClientConfig {
     
     pub fn disable_cert_verification(mut self) -> Self {
         self.verify_cert = false;
+        self
+    }
+    
+    pub fn enable_cert_verification(mut self) -> Self {
+        self.verify_cert = true;
+        self
+    }
+    
+    pub fn with_ca_cert(mut self, cert_path: PathBuf) -> Self {
+        self.ca_cert_path = Some(cert_path);
+        self.verify_cert = true;
+        self
+    }
+    
+    pub fn with_max_retries(mut self, retries: usize) -> Self {
+        self.max_retries = retries;
         self
     }
 }
