@@ -276,10 +276,29 @@ impl TransferManager {
         let mut hash_request_received = false;
         let mut chunk_hashes_to_check = vec![];
         let mut idle_iterations = 0;
-        const MAX_IDLE: usize = 100;
+        const MAX_IDLE: usize = 500;  // Increased timeout: 500 * 10ms = 5 seconds
+        
+        socket.set_read_timeout(Some(Duration::from_millis(10)))?;
         
         while !hash_request_received && idle_iterations < MAX_IDLE {
-            // Check for hash check request
+            // Process network I/O to receive hash check request
+            match socket.recv_from(&mut buf) {
+                Ok((len, from)) => {
+                    let _ = connection.process_packet(&mut buf[..len], from, socket.local_addr()?);
+                    idle_iterations = 0;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    idle_iterations += 1;
+                }
+                Err(e) => {
+                    log::warn!("Server: socket recv error during hash check: {:?}", e);
+                }
+            }
+            
+            // Send any response packets
+            let _ = connection.send_packets(socket, &mut out);
+            
+            // Check for hash check request on STREAM_HASH_CHECK
             while let Ok((read, fin)) = connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
                 if read > 0 {
                     if let Some(request) = hash_request_receiver.receive_chunk(&buf[..read], fin)? {
@@ -298,12 +317,14 @@ impl TransferManager {
                 break;
             }
             
-            idle_iterations += 1;
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if connection.is_closed() {
+                log::warn!("Server: connection closed during hash check");
+                break;
+            }
         }
         
         if !hash_request_received {
-            log::warn!("Server: hash check request not received, proceeding without dedup");
+            log::warn!("Server: hash check request not received after {} iterations, proceeding without dedup", idle_iterations);
         }
         
         // Check which hashes exist in the index

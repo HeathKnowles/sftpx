@@ -3,7 +3,7 @@
 use std::net::UdpSocket;
 use std::time::Duration;
 use std::path::{Path, PathBuf};
-use log::{info, debug, error};
+use log::{info, debug, error, warn};
 use crate::common::error::{Error, Result};
 use crate::common::config::ClientConfig;
 use crate::common::types::*;
@@ -760,7 +760,9 @@ impl Transfer {
         let mut received_response = false;
         let mut existing_hashes = vec![];
         let mut idle_iterations = 0;
-        const MAX_IDLE: usize = 100;
+        const MAX_IDLE: usize = 500;  // 500 * 10ms = 5 seconds to match server
+        
+        debug!("Client: waiting for hash check response on stream {}...", STREAM_HASH_CHECK);
         
         while !received_response && idle_iterations < MAX_IDLE {
             // Flush outgoing packets
@@ -802,12 +804,15 @@ impl Transfer {
             }
             
             if connection.is_closed() {
+                warn!("Client: connection closed during hash check");
                 return Err(Error::ConnectionClosed);
             }
         }
         
         if !received_response {
-            return Err(Error::Protocol("Hash check response not received".to_string()));
+            warn!("Client: hash check response not received after {} iterations, proceeding without dedup", idle_iterations);
+            // Continue without deduplication rather than failing
+            return Ok(vec![]);
         }
         
         Ok(existing_hashes)
