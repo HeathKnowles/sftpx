@@ -8,7 +8,7 @@ use crate::common::error::{Error, Result};
 use crate::common::config::ClientConfig;
 use crate::common::types::*;
 use super::connection::ClientConnection;
-use super::streams::{StreamManager, STREAM_CONTROL, STREAM_DATA1, STREAM_DATA2, STREAM_DATA3};
+use super::streams::{StreamManager, STREAM_CONTROL, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS};
 use super::session::ClientSession;
 
 pub struct Transfer {
@@ -147,7 +147,7 @@ impl Transfer {
         
         // Initialize stream priorities
         self.stream_manager.initialize_streams(&mut connection)?;
-        info!("Client: initialized 4 streams (control, data1, data2, data3)");
+        info!("Client: initialized 4 streams (control, manifest, data, status)");
         
         // --- APPLICATION DATA PHASE ---
         info!("Client: sending application messages on 4 streams...");
@@ -156,9 +156,9 @@ impl Transfer {
         // Send test messages on each stream
         let messages: Vec<(u64, &[u8])> = vec![
             (STREAM_CONTROL, b"Control message from client"),
-            (STREAM_DATA1, b"Data1 message from client"),
-            (STREAM_DATA2, b"Data2 message from client"),
-            (STREAM_DATA3, b"Data3 message from client"),
+            (STREAM_MANIFEST, b"Manifest message from client"),
+            (STREAM_DATA, b"Data message from client"),
+            (STREAM_STATUS, b"Status message from client"),
         ];
         
         for (stream_id, message) in &messages {

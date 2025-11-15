@@ -7,10 +7,10 @@ use super::connection::ClientConnection;
 pub use crate::common::types::StreamType;
 
 /// Stream IDs for the 4 application streams
-pub const STREAM_CONTROL: u64 = 0;  // Bidirectional stream 0
-pub const STREAM_DATA1: u64 = 4;    // Bidirectional stream 1
-pub const STREAM_DATA2: u64 = 8;    // Bidirectional stream 2
-pub const STREAM_DATA3: u64 = 12;   // Bidirectional stream 3
+pub const STREAM_CONTROL: u64 = 0;  // Bidirectional stream 0 - Control commands
+pub const STREAM_MANIFEST: u64 = 4;  // Bidirectional stream 1 - File manifest/metadata
+pub const STREAM_DATA: u64 = 8;      // Bidirectional stream 2 - File data chunks
+pub const STREAM_STATUS: u64 = 12;   // Bidirectional stream 3 - Transfer status updates
 
 pub struct StreamManager {
     streams: HashMap<u64, StreamInfo>,
@@ -38,25 +38,25 @@ impl StreamManager {
             bytes_received: 0,
         });
         
-        streams.insert(STREAM_DATA1, StreamInfo {
-            stream_id: STREAM_DATA1,
-            name: "data1".to_string(),
+        streams.insert(STREAM_MANIFEST, StreamInfo {
+            stream_id: STREAM_MANIFEST,
+            name: "manifest".to_string(),
             is_finished: false,
             bytes_sent: 0,
             bytes_received: 0,
         });
         
-        streams.insert(STREAM_DATA2, StreamInfo {
-            stream_id: STREAM_DATA2,
-            name: "data2".to_string(),
+        streams.insert(STREAM_DATA, StreamInfo {
+            stream_id: STREAM_DATA,
+            name: "data".to_string(),
             is_finished: false,
             bytes_sent: 0,
             bytes_received: 0,
         });
         
-        streams.insert(STREAM_DATA3, StreamInfo {
-            stream_id: STREAM_DATA3,
-            name: "data3".to_string(),
+        streams.insert(STREAM_STATUS, StreamInfo {
+            stream_id: STREAM_STATUS,
+            name: "status".to_string(),
             is_finished: false,
             bytes_sent: 0,
             bytes_received: 0,
@@ -69,9 +69,9 @@ impl StreamManager {
     pub fn set_stream_priority(&self, conn: &mut ClientConnection, stream_id: u64) -> Result<()> {
         let (urgency, incremental) = match stream_id {
             STREAM_CONTROL => (0, false),  // Highest priority, non-incremental
-            STREAM_DATA1 => (3, true),     // Lower priority, incremental
-            STREAM_DATA2 => (3, true),     // Lower priority, incremental
-            STREAM_DATA3 => (3, true),     // Lower priority, incremental
+            STREAM_MANIFEST => (2, false), // High priority, non-incremental (metadata)
+            STREAM_DATA => (4, true),      // Medium priority, incremental (bulk data)
+            STREAM_STATUS => (3, false),   // Medium-high priority, non-incremental (status updates)
             _ => (7, true),                // Lowest priority for unknown streams
         };
         
@@ -140,7 +140,7 @@ impl StreamManager {
     
     /// Initialize all streams with proper priorities
     pub fn initialize_streams(&self, conn: &mut ClientConnection) -> Result<()> {
-        for stream_id in [STREAM_CONTROL, STREAM_DATA1, STREAM_DATA2, STREAM_DATA3] {
+        for stream_id in [STREAM_CONTROL, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS] {
             self.set_stream_priority(conn, stream_id)?;
         }
         Ok(())
@@ -148,6 +148,6 @@ impl StreamManager {
     
     /// Get all stream IDs
     pub fn get_all_stream_ids(&self) -> Vec<u64> {
-        vec![STREAM_CONTROL, STREAM_DATA1, STREAM_DATA2, STREAM_DATA3]
+        vec![STREAM_CONTROL, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS]
     }
 }

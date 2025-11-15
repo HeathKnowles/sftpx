@@ -18,9 +18,9 @@ Processes readable streams and handles application data
 4. streams.rs - Stream Management
 4 streams per connection:
 Control (stream ID: 0)
-Data1 (stream ID: 4)
-Data2 (stream ID: 8)
-Data3 (stream ID: 12)
+Manifest (stream ID: 4) - File metadata and chunk table
+Data (stream ID: 8) - Compressed file chunks
+Status (stream ID: 12) - Transfer progress and acknowledgments
 StreamManager tracks all streams with statistics
 Stream activation/deactivation
 Bytes sent/received tracking per stream
@@ -37,7 +37,7 @@ transfer_data_multistream() - Transfer data across all 4 streams
 transfer_file_multistream() - Transfer files using parallel streams
 Configurable chunk size (default: 8KB)
 Key Features:
-✅ 4 streams per connection (Control, Data1, Data2, Data3)
+✅ 4 streams per connection (Control, Manifest, Data, Status)
 ✅ Certificate paths point to certs/cert.pem and certs/key.pem
 ✅ Data sending function with multiple modes (single stream, chunked, distributed)
 ✅ Complete QUIC handshake handling

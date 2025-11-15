@@ -1,2 +1,12 @@
 target/*
 Cargo.lock
+*.bin
+*.exe
+*.dll
+*.so
+*.log
+*.mp4
+*.txt
+*.json
+*.mkv
+*.avi

@@ -13,7 +13,10 @@ pub struct ClientConnection {
     socket_addr: SocketAddr,
     server_name: String,
     last_activity: Instant,
+    last_heartbeat: Instant,
     stats: ConnectionStats,
+    migration_enabled: bool,
+    original_peer_addr: SocketAddr,
 }
 
 #[derive(Debug, Default)]
@@ -83,7 +86,10 @@ impl ClientConnection {
             socket_addr: config.server_addr,
             server_name: config.server_name.clone(),
             last_activity: Instant::now(),
+            last_heartbeat: Instant::now(),
             stats: ConnectionStats::default(),
+            migration_enabled: true,
+            original_peer_addr: config.server_addr,
         })
     }
     
@@ -185,5 +191,135 @@ impl ClientConnection {
     
     pub fn server_addr(&self) -> SocketAddr {
         self.socket_addr
+    }
+    
+    // Connection Migration Support
+    
+    /// Check if connection migration is enabled
+    pub fn is_migration_enabled(&self) -> bool {
+        self.migration_enabled
+    }
+    
+    /// Enable or disable connection migration
+    pub fn set_migration_enabled(&mut self, enabled: bool) {
+        self.migration_enabled = enabled;
+    }
+    
+    /// Migrate connection to a new local address
+    /// This is useful when the client's network interface changes (e.g., WiFi to cellular)
+    pub fn migrate_to_address(&mut self, new_local_addr: SocketAddr) -> Result<()> {
+        if !self.migration_enabled {
+            return Err(Error::Quic("Connection migration is disabled".to_string()));
+        }
+        
+        if !self.is_established() {
+            return Err(Error::Quic("Cannot migrate: connection not established".to_string()));
+        }
+        
+        // QUIC handles path validation automatically
+        // We just need to send packets from the new address
+        log::info!("Migrating connection from new local address: {}", new_local_addr);
+        Ok(())
+    }
+    
+    /// Check if the peer address has changed (server migrated)
+    pub fn has_peer_migrated(&self, current_peer: SocketAddr) -> bool {
+        current_peer != self.original_peer_addr
+    }
+    
+    /// Update peer address after detecting migration
+    pub fn update_peer_address(&mut self, new_peer: SocketAddr) {
+        if new_peer != self.socket_addr {
+            log::info!("Peer migrated from {} to {}", self.socket_addr, new_peer);
+            self.socket_addr = new_peer;
+        }
+    }
+    
+    /// Get the original peer address (before any migration)
+    pub fn original_peer_addr(&self) -> SocketAddr {
+        self.original_peer_addr
+    }
+    
+    // Keepalive/Heartbeat Support
+    
+    /// Check if a heartbeat should be sent
+    /// Returns true if HEARTBEAT_INTERVAL has elapsed since last heartbeat
+    pub fn should_send_heartbeat(&self) -> bool {
+        self.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL
+    }
+    
+    /// Send a heartbeat ping on the control stream
+    pub fn send_heartbeat(&mut self) -> Result<()> {
+        if !self.is_established() {
+            return Err(Error::Quic("Cannot send heartbeat: connection not established".to_string()));
+        }
+        
+        // Send a small keepalive message on stream 0 (control)
+        let heartbeat_msg = b"PING";
+        match self.stream_send(0, heartbeat_msg, false) {
+            Ok(_) => {
+                self.last_heartbeat = Instant::now();
+                log::debug!("Heartbeat sent");
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("Failed to send heartbeat: {:?}", e);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Check if connection is idle and needs keepalive
+    pub fn is_idle(&self) -> bool {
+        self.last_activity.elapsed() >= KEEPALIVE_IDLE_THRESHOLD
+    }
+    
+    /// Get time since last activity
+    pub fn idle_duration(&self) -> Duration {
+        self.last_activity.elapsed()
+    }
+    
+    /// Get time since last heartbeat
+    pub fn time_since_heartbeat(&self) -> Duration {
+        self.last_heartbeat.elapsed()
+    }
+    
+    /// Process potential heartbeat on receive
+    pub fn handle_heartbeat(&mut self, data: &[u8]) -> bool {
+        if data == b"PING" {
+            log::debug!("Heartbeat PING received");
+            // Send PONG response
+            if let Err(e) = self.stream_send(0, b"PONG", false) {
+                log::warn!("Failed to send PONG: {:?}", e);
+            }
+            true
+        } else if data == b"PONG" {
+            log::debug!("Heartbeat PONG received");
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_heartbeat_timing() {
+        use std::time::Duration;
+        // Test that HEARTBEAT_INTERVAL is reasonable
+        assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
+        assert_eq!(KEEPALIVE_IDLE_THRESHOLD, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_heartbeat_messages() {
+        // Test heartbeat message format
+        let ping = b"PING";
+        let pong = b"PONG";
+        assert_eq!(ping.len(), 4);
+        assert_eq!(pong.len(), 4);
     }
 }

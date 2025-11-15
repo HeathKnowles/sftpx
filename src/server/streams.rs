@@ -8,9 +8,9 @@ const NUM_STREAMS: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamType {
     Control,
-    Data1,
-    Data2,
-    Data3,
+    Manifest,
+    Data,
+    Status,
 }
 
 impl StreamType {
@@ -18,9 +18,9 @@ impl StreamType {
     pub fn stream_id(&self) -> u64 {
         match self {
             StreamType::Control => 0,
-            StreamType::Data1 => 4,
-            StreamType::Data2 => 8,
-            StreamType::Data3 => 12,
+            StreamType::Manifest => 4,
+            StreamType::Data => 8,
+            StreamType::Status => 12,
         }
     }
 
@@ -28,9 +28,9 @@ impl StreamType {
     pub fn all() -> [StreamType; NUM_STREAMS] {
         [
             StreamType::Control,
-            StreamType::Data1,
-            StreamType::Data2,
-            StreamType::Data3,
+            StreamType::Manifest,
+            StreamType::Data,
+            StreamType::Status,
         ]
     }
 }
@@ -159,9 +159,9 @@ mod tests {
     #[test]
     fn test_stream_ids() {
         assert_eq!(StreamType::Control.stream_id(), 0);
-        assert_eq!(StreamType::Data1.stream_id(), 4);
-        assert_eq!(StreamType::Data2.stream_id(), 8);
-        assert_eq!(StreamType::Data3.stream_id(), 12);
+        assert_eq!(StreamType::Manifest.stream_id(), 4);
+        assert_eq!(StreamType::Data.stream_id(), 8);
+        assert_eq!(StreamType::Status.stream_id(), 12);
     }
 
     #[test]
