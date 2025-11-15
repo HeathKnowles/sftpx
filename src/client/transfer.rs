@@ -1,7 +1,7 @@
 // Client-side transfer logic
 
 use std::net::UdpSocket;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 use log::{info, debug, error};
 use crate::common::error::{Error, Result};
@@ -12,7 +12,8 @@ use crate::transport::manifest_stream::ManifestReceiver;
 use crate::protocol::control::ControlMessage;
 use crate::client::receiver::FileReceiver;
 use super::connection::ClientConnection;
-use super::streams::{StreamManager, STREAM_CONTROL, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS};
+use super::streams::{StreamManager, STREAM_CONTROL, STREAM_HASH_CHECK, STREAM_MANIFEST, STREAM_DATA, STREAM_STATUS};
+use crate::protocol::hash_check::{HashCheckRequestSender, HashCheckResponseReceiver};
 use super::session::ClientSession;
 
 pub struct Transfer {
@@ -102,8 +103,6 @@ impl Transfer {
         // --- HANDSHAKE PHASE ---
         info!("Client: waiting for handshake to complete...");
         let mut handshake_iter = 0;
-        let handshake_start = Instant::now();
-        let handshake_timeout = Duration::from_secs(10);
         
         loop {
             // Receive packets
@@ -140,10 +139,6 @@ impl Transfer {
             if handshake_iter % 10 == 0 {
                 debug!("Client: handshake iter={} is_established={} peer_streams_left_bidi={}",
                     handshake_iter, connection.is_established(), connection.peer_streams_left_bidi());
-            }
-            
-            if handshake_start.elapsed() > handshake_timeout {
-                return Err(Error::TransferTimeout);
             }
             
             std::thread::sleep(Duration::from_millis(10));
@@ -185,8 +180,6 @@ impl Transfer {
         // Wait for responses from all 4 streams
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         let mut done = false;
-        let start = Instant::now();
-        let timeout = Duration::from_secs(10);
         let mut received_streams = std::collections::HashSet::new();
         
         loop {
@@ -250,11 +243,6 @@ impl Transfer {
             }
             
             if done || connection.is_closed() {
-                break;
-            }
-            
-            if start.elapsed() > timeout {
-                info!("Client: timeout (received from {} streams)", received_streams.len());
                 break;
             }
             
@@ -415,8 +403,6 @@ impl Transfer {
         local_addr: std::net::SocketAddr,
     ) -> Result<()> {
         info!("Client: waiting for handshake to complete...");
-        let handshake_start = Instant::now();
-        let handshake_timeout = Duration::from_secs(10);
         
         loop {
             socket.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -440,10 +426,6 @@ impl Transfer {
                 break;
             }
             
-            if handshake_start.elapsed() > handshake_timeout {
-                return Err(Error::TransferTimeout);
-            }
-            
             std::thread::sleep(Duration::from_millis(10));
         }
         
@@ -462,8 +444,6 @@ impl Transfer {
         info!("Client: receiving manifest on stream {}...", STREAM_MANIFEST);
         
         let mut manifest_receiver = ManifestReceiver::new();
-        let timeout = Duration::from_secs(30);
-        let start = Instant::now();
         
         loop {
             // Receive packets
@@ -510,10 +490,6 @@ impl Transfer {
                 socket.send_to(&out[..len], send_info.to)?;
             }
             
-            if start.elapsed() > timeout {
-                return Err(Error::Protocol("Manifest receive timeout".to_string()));
-            }
-            
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -554,8 +530,6 @@ impl Transfer {
         
         receiver.enable_auto_retransmit(session_id, control_sender);
         
-        let timeout = Duration::from_secs(300); // 5 minutes
-        let start = Instant::now();
         let mut last_progress = 0.0;
         
         loop {
@@ -632,10 +606,6 @@ impl Transfer {
                 )));
             }
             
-            if start.elapsed() > timeout {
-                return Err(Error::TransferTimeout);
-            }
-            
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -651,8 +621,6 @@ impl Transfer {
         local_addr: std::net::SocketAddr,
         file_path: &Path,
     ) -> Result<(u64, crate::protocol::messages::Manifest, Vec<Vec<u8>>)> {
-        use crate::protocol::hash_check::{HashCheckRequestSender, HashCheckResponseReceiver};
-        
         info!("Client: building manifest for upload...");
         
         // Generate session ID
@@ -738,91 +706,112 @@ impl Transfer {
         
         info!("Client: manifest sent ({} bytes)", total_sent);
         
-        // Send hash check request on STREAM_CONTROL (optional - skip if it fails)
-        info!("Client: sending hash check request for {} chunks", manifest.chunk_hashes.len());
+        // Phase 3: Hash check on dedicated server-initiated stream (STREAM_HASH_CHECK)
+        info!("Client: performing hash check for deduplication");
+        
+        let chunk_hashes: Vec<Vec<u8>> = manifest.chunk_hashes.clone();
+        let existing_hashes = self.hash_check_phase(
+            socket,
+            connection,
+            buf,
+            out,
+            local_addr,
+            &session_id,
+            chunk_hashes,
+        )?;
+        
+        info!("Client: hash check complete, {} chunks already exist", existing_hashes.len());
+        
+        Ok((total_sent as u64, manifest, existing_hashes))
+    }
+    
+    /// Hash check phase - check which chunks already exist on server
+    fn hash_check_phase(
+        &mut self,
+        socket: &UdpSocket,
+        connection: &mut ClientConnection,
+        buf: &mut [u8],
+        out: &mut [u8],
+        local_addr: std::net::SocketAddr,
+        session_id: &str,
+        chunk_hashes: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>> {
+        // Send hash check request on server-initiated stream (STREAM_HASH_CHECK)
         let hash_sender = HashCheckRequestSender::new();
         
-        let hash_sent = hash_sender.send_request(
-            session_id.clone(),
-            manifest.chunk_hashes.clone(),
+        let send_result = hash_sender.send_request(
+            session_id.to_string(),
+            chunk_hashes.clone(),
             |data, fin| {
-                let written = connection.stream_send(STREAM_CONTROL, data, fin)?;
-                
-                // Flush packets
-                while let Ok((len, send_info)) = connection.send(out) {
-                    socket.send_to(&out[..len], send_info.to)?;
-                }
-                
-                Ok(written)
-            }
-        );
+                // Send on STREAM_HASH_CHECK - this is a server-initiated bidirectional stream
+                // The server opens it (ID 1), but client can write to it
+                connection.stream_send(STREAM_HASH_CHECK, data, fin)
+            },
+        )?;
         
-        if hash_sent.is_err() {
-            info!("Client: hash check request failed, proceeding without dedup");
-            return Ok((total_sent as u64, manifest, vec![]));
+        debug!("Hash check request sent: {} bytes", send_result);
+        
+        // Flush outgoing packets
+        while let Ok((write, send_info)) = connection.send(out) {
+            socket.send_to(&out[..write], send_info.to)?;
         }
         
-        info!("Client: hash check request sent, waiting for response...");
+        // Receive hash check response on same stream
+        let mut response_receiver = HashCheckResponseReceiver::new();
+        let mut received_response = false;
+        let mut existing_hashes = vec![];
+        let mut idle_iterations = 0;
+        const MAX_IDLE: usize = 100;
         
-        // Wait for hash check response on STREAM_CONTROL
-        let mut hash_receiver = HashCheckResponseReceiver::new();
-        let hash_timeout = Duration::from_secs(10);
-        let hash_start = Instant::now();
-        
-        let existing_hashes = 'hash_loop: loop {
-            // Receive packets
-            socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-            match socket.recv_from(buf) {
-                Ok((len, from)) => {
-                    let recv_info = quiche::RecvInfo { from, to: local_addr };
-                    let _ = connection.recv(&mut buf[..len], recv_info);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock ||
-                          e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => return Err(Error::from(e)),
+        while !received_response && idle_iterations < MAX_IDLE {
+            // Flush outgoing packets
+            while let Ok((write, send_info)) = connection.send(out) {
+                socket.send_to(&out[..write], send_info.to)?;
+                idle_iterations = 0;
             }
             
-            // Check for readable streams
-            let readable: Vec<u64> = connection.readable().collect();
-            for stream_id in readable {
-                if stream_id == STREAM_CONTROL {
-                    loop {
-                        match connection.stream_recv(stream_id, buf) {
-                            Ok((read, fin)) => {
-                                if read == 0 {
-                                    break;
-                                }
-                                
-                                if let Some(response) = hash_receiver.receive_chunk(&buf[..read], fin)? {
-                                    info!("Client: received hash check response - {} hashes exist on server", 
-                                        response.existing_hashes.len());
-                                    break 'hash_loop response.existing_hashes;
-                                }
-                                
-                                if fin {
-                                    break;
-                                }
+            // Receive data
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo {
+                        to: local_addr,
+                        from,
+                    };
+                    
+                    let _ = connection.recv(&mut buf[..len], recv_info);
+                    idle_iterations = 0;
+                    
+                    // Check for hash check response on STREAM_HASH_CHECK
+                    while let Ok((read, fin)) = connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
+                        if read > 0 {
+                            if let Some(response) = response_receiver.receive_chunk(&buf[..read], fin)? {
+                                existing_hashes = response.existing_hashes;
+                                received_response = true;
+                                break;
                             }
-                            Err(_) => break,
+                        }
+                        if fin {
+                            break;
                         }
                     }
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    idle_iterations += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(Error::from(e)),
             }
             
-            // Send any pending packets
-            while let Ok((len, send_info)) = connection.send(out) {
-                socket.send_to(&out[..len], send_info.to)?;
+            if connection.is_closed() {
+                return Err(Error::ConnectionClosed);
             }
-            
-            if hash_start.elapsed() > hash_timeout {
-                info!("Client: hash check response timeout, proceeding without dedup");
-                break vec![];
-            }
-            
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        }
         
-        Ok((total_sent as u64, manifest, existing_hashes))
+        if !received_response {
+            return Err(Error::Protocol("Hash check response not received".to_string()));
+        }
+        
+        Ok(existing_hashes)
     }
     
     /// Send file phase - send file chunks to server
@@ -909,10 +898,10 @@ impl Transfer {
                 (chunks_skipped as f64 / total_chunks as f64) * 100.0);
         }
         
-        // Final flush - keep sending until connection is drained
+        // Final flush - keep sending until connection is drained or nothing left to send
         info!("Client: flushing final packets...");
-        let flush_start = Instant::now();
-        let flush_timeout = Duration::from_secs(5);
+        let mut idle_iterations = 0;
+        let max_idle_iterations = 100; // ~500ms of idle time
         
         loop {
             // Send any pending packets
@@ -929,14 +918,15 @@ impl Transfer {
                 let _ = connection.recv(&mut buf[..len], recv_info);
             }
             
-            // If nothing was sent and we've waited a bit, we're done
-            if !sent_any && flush_start.elapsed() > Duration::from_millis(500) {
-                break;
-            }
-            
-            if flush_start.elapsed() > flush_timeout {
-                log::warn!("Client: flush timeout after {} seconds", flush_timeout.as_secs());
-                break;
+            // If nothing was sent, increment idle counter
+            if !sent_any {
+                idle_iterations += 1;
+                if idle_iterations > max_idle_iterations {
+                    info!("Client: flush complete (no more packets to send)");
+                    break;
+                }
+            } else {
+                idle_iterations = 0; // Reset on activity
             }
             
             std::thread::sleep(Duration::from_millis(5));

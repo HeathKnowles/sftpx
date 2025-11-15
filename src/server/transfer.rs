@@ -4,9 +4,11 @@ use super::connection::ServerConnection;
 use super::sender::DataSender;
 use crate::protocol::manifest::ManifestBuilder;
 use crate::transport::manifest_stream::ManifestSender;
+use crate::protocol::hash_check::{HashCheckRequestReceiver, HashCheckResponseSender};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_CHUNK_SIZE: usize = 8192;
+const STREAM_HASH_CHECK: u64 = 1;  // Server-initiated bidirectional stream for hash checks
 
 /// Manages file transfers to clients
 pub struct TransferManager {
@@ -204,7 +206,7 @@ impl TransferManager {
     ) -> Result<(PathBuf, u64), Box<dyn std::error::Error>> {
         use crate::transport::manifest_stream::ManifestReceiver;
         use crate::client::receiver::FileReceiver;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         
         log::info!("TransferManager: starting integrated file receive");
         
@@ -215,8 +217,6 @@ impl TransferManager {
         log::info!("Receiving manifest on stream {}...", manifest_stream);
         let mut manifest_receiver = ManifestReceiver::new();
         let mut manifest_buffer = vec![0u8; 65535];
-        let manifest_timeout = Duration::from_secs(10);
-        let manifest_start = Instant::now();
         
         let manifest = loop {
             // First, receive packets from network
@@ -248,9 +248,6 @@ impl TransferManager {
                     }
                 }
                 Err(quiche::Error::Done) => {
-                    if manifest_start.elapsed() > manifest_timeout {
-                        return Err("Manifest receive timeout".into());
-                    }
                     continue;
                 }
                 Err(e) => {
@@ -262,116 +259,78 @@ impl TransferManager {
         log::info!("Manifest received: {} chunks, {} bytes", 
             manifest.total_chunks, manifest.file_size);
         
-        // --- HASH CHECK PHASE ---
-        // Wait for hash check request on control stream (stream 0)
-        log::info!("Server: waiting for hash check request on control stream...");
-        use crate::protocol::hash_check::{HashCheckRequestReceiver, HashCheckResponseSender};
+        // --- HASH CHECK PHASE (Deduplication) ---
+        log::info!("Server: waiting for hash check request on stream {}...", STREAM_HASH_CHECK);
+        
+        // Create chunk index
         use crate::chunking::ChunkHashIndex;
-        
-        let control_stream = 0u64;
-        let mut hash_request_receiver = HashCheckRequestReceiver::new();
-        let hash_check_timeout = Duration::from_secs(10);
-        let hash_check_start = Instant::now();
-        let mut control_buffer = vec![0u8; 65535];
-        
-        let hash_request = loop {
-            // Receive network packets
-            socket.set_read_timeout(Some(Duration::from_millis(10)))?;
-            if let Ok((len, from)) = socket.recv_from(&mut buf) {
-                let _ = connection.process_packet(&mut buf[..len], from, socket.local_addr()?);
-            }
-            
-            // Send any response packets
-            let _ = connection.send_packets(socket, &mut out);
-            
-            // Read from control stream
-            match connection.stream_recv(control_stream, &mut control_buffer) {
-                Ok((read, fin)) => {
-                    if read > 0 {
-                        match hash_request_receiver.receive_chunk(&control_buffer[..read], fin) {
-                            Ok(Some(req)) => {
-                                log::info!("Server: received hash check request with {} hashes", req.chunk_hashes.len());
-                                break req;
-                            }
-                            Ok(None) => {
-                                // Need more data
-                                continue;
-                            }
-                            Err(e) => {
-                                log::warn!("Server: hash check request error: {:?}", e);
-                                // Continue without dedup if request fails
-                                break crate::protocol::messages::HashCheckRequest {
-                                    session_id: manifest.session_id.clone(),
-                                    chunk_hashes: vec![],
-                                };
-                            }
-                        }
-                    }
-                }
-                Err(quiche::Error::Done) => {
-                    if hash_check_start.elapsed() > hash_check_timeout {
-                        log::warn!("Server: hash check timeout, proceeding without dedup");
-                        // Continue without dedup
-                        break crate::protocol::messages::HashCheckRequest {
-                            session_id: manifest.session_id.clone(),
-                            chunk_hashes: vec![],
-                        };
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    log::warn!("Server: hash check stream error: {:?}, proceeding without dedup", e);
-                    // Continue without dedup
-                    break crate::protocol::messages::HashCheckRequest {
-                        session_id: manifest.session_id.clone(),
-                        chunk_hashes: vec![],
-                    };
-                }
-            }
-        };
-        
-        // Load or create chunk hash index
         let index_dir = output_dir.join(".sftpx");
         std::fs::create_dir_all(&index_dir)?;
-        
         let mut chunk_index = ChunkHashIndex::new(&index_dir).unwrap_or_else(|e| {
-            log::warn!("Server: failed to create/load chunk index: {:?}, creating new", e);
-            // Fallback - shouldn't happen but handle gracefully
+            log::warn!("Server: failed to create/load chunk index: {:?}", e);
             ChunkHashIndex::new(&std::env::temp_dir()).expect("Failed to create temp index")
         });
         
-        // Check which hashes already exist
-        let existing_hashes = if !hash_request.chunk_hashes.is_empty() {
-            let existing = chunk_index.check_hashes(&hash_request.chunk_hashes);
-            log::info!("Server: {} out of {} chunks already exist", 
-                existing.len(), hash_request.chunk_hashes.len());
-            existing
-        } else {
-            vec![]
-        };
+        // Receive hash check request on server-initiated stream STREAM_HASH_CHECK
+        let mut hash_request_receiver = HashCheckRequestReceiver::new();
+        let mut hash_request_received = false;
+        let mut chunk_hashes_to_check = vec![];
+        let mut idle_iterations = 0;
+        const MAX_IDLE: usize = 100;
         
-        // Send hash check response (gracefully handle errors)
-        let hash_sender = HashCheckResponseSender::new();
-        match hash_sender.send_response(
-            hash_request.session_id.clone(),
-            existing_hashes.clone(),
-            |data, fin| {
-                let written = connection.stream_send(control_stream, data, fin)
-                    .map_err(|e| crate::common::error::Error::Protocol(format!("Stream send error: {:?}", e)))?;
-                
-                // Flush packets
-                connection.send_packets(socket, &mut out)
-                    .map_err(|e| crate::common::error::Error::Protocol(format!("Send packets error: {:?}", e)))?;
-                
-                Ok(written)
+        while !hash_request_received && idle_iterations < MAX_IDLE {
+            // Check for hash check request
+            while let Ok((read, fin)) = connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
+                if read > 0 {
+                    if let Some(request) = hash_request_receiver.receive_chunk(&buf[..read], fin)? {
+                        chunk_hashes_to_check = request.chunk_hashes;
+                        hash_request_received = true;
+                        log::info!("Server: received hash check request with {} hashes", chunk_hashes_to_check.len());
+                        break;
+                    }
+                }
+                if fin {
+                    break;
+                }
             }
-        ) {
-            Ok(_) => {
-                log::info!("Server: sent hash check response with {} existing hashes", existing_hashes.len());
+            
+            if hash_request_received {
+                break;
             }
-            Err(e) => {
-                log::warn!("Server: failed to send hash check response: {:?}, proceeding without dedup", e);
+            
+            idle_iterations += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        
+        if !hash_request_received {
+            log::warn!("Server: hash check request not received, proceeding without dedup");
+        }
+        
+        // Check which hashes exist in the index
+        let mut existing_hashes = vec![];
+        for hash in &chunk_hashes_to_check {
+            if chunk_index.has_chunk(hash) {
+                existing_hashes.push(hash.clone());
             }
+        }
+        
+        log::info!("Server: {} out of {} chunks already exist", 
+            existing_hashes.len(), chunk_hashes_to_check.len());
+        
+        // Send hash check response back on same stream
+        if hash_request_received {
+            let hash_response_sender = HashCheckResponseSender::new();
+            
+            hash_response_sender.send_response(
+                manifest.session_id.clone(),
+                existing_hashes.clone(),
+                |data, fin| {
+                    connection.stream_send(STREAM_HASH_CHECK, data, fin)
+                        .map_err(|e| crate::common::error::Error::Protocol(format!("Failed to send hash check response: {:?}", e)))
+                }
+            )?;
+            
+            log::info!("Server: sent hash check response");
         }
         
         // --- FILE RECEIVE PHASE ---
@@ -386,8 +345,6 @@ impl TransferManager {
         
         let mut stream_buffer = Vec::new(); // Accumulate stream data
         let mut chunk_buffer = vec![0u8; 65535];
-        let receive_timeout = Duration::from_secs(30);
-        let mut last_activity = Instant::now();
         let mut last_progress = 0.0;
         let mut chunks_received = 0u64;
         let mut expecting_length = true;
@@ -407,7 +364,6 @@ impl TransferManager {
             match connection.stream_recv(data_stream, &mut chunk_buffer) {
                 Ok((read, fin)) => {
                     if read > 0 {
-                        last_activity = Instant::now(); // Reset activity timer on data
                         stream_buffer.extend_from_slice(&chunk_buffer[..read]);
                         
                         // Process complete messages with length framing
@@ -473,21 +429,11 @@ impl TransferManager {
                         break;
                     }
                     
-                    // Only timeout if no activity (data stopped flowing)
-                    if last_activity.elapsed() > receive_timeout {
-                        log::warn!("Server: no activity for {} seconds, chunks: {}/{}",
-                            receive_timeout.as_secs(), chunks_received, manifest.total_chunks);
-                        return Err("File receive timeout - no activity".into());
-                    }
-                    
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 Err(quiche::Error::InvalidStreamState(_)) => {
                     // Stream not ready yet, wait for data
-                    if last_activity.elapsed() > receive_timeout {
-                        return Err("File receive timeout waiting for stream".into());
-                    }
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }

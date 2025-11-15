@@ -6,11 +6,15 @@ use super::connection::ClientConnection;
 
 pub use crate::common::types::StreamType;
 
-/// Stream IDs for the 4 application streams
-pub const STREAM_CONTROL: u64 = 0;  // Bidirectional stream 0 - Control commands
-pub const STREAM_MANIFEST: u64 = 4;  // Bidirectional stream 1 - File manifest/metadata
-pub const STREAM_DATA: u64 = 8;      // Bidirectional stream 2 - File data chunks
-pub const STREAM_STATUS: u64 = 12;   // Bidirectional stream 3 - Transfer status updates
+/// Stream IDs for application streams
+/// QUIC stream numbering: client-initiated bidirectional use 0,4,8,12...
+/// Server-initiated bidirectional use 1,5,9,13...
+pub const STREAM_CONTROL: u64 = 0;     // Client-initiated bidirectional - Control commands
+pub const STREAM_HASH_CHECK: u64 = 1;  // Server-initiated bidirectional - Hash check requests/responses
+pub const STREAM_MANIFEST: u64 = 4;    // Client-initiated bidirectional - File manifest/metadata
+pub const STREAM_DATA: u64 = 8;        // Client-initiated bidirectional - File data chunks
+pub const STREAM_STATUS: u64 = 12;     // Client-initiated bidirectional - Transfer status updates
+pub const STREAM_DELTA: u64 = 5;       // Server-initiated bidirectional - Delta sync requests/patches
 
 pub struct StreamManager {
     streams: HashMap<u64, StreamInfo>,

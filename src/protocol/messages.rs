@@ -262,6 +262,98 @@ pub struct HashCheckResponse {
     pub existing_bitmap: Option<Vec<u8>>,
 }
 
+/// Request to perform delta sync on a file (rsync-like)
+#[derive(Clone, PartialEq, Message)]
+pub struct DeltaRequest {
+    /// Session ID
+    #[prost(string, tag = "1")]
+    pub session_id: String,
+    
+    /// Remote file path to sync
+    #[prost(string, tag = "2")]
+    pub remote_file_path: String,
+    
+    /// Local file hash (BLAKE3) - for comparison
+    #[prost(bytes, tag = "3")]
+    pub local_file_hash: Vec<u8>,
+    
+    /// Local file size
+    #[prost(uint64, tag = "4")]
+    pub local_file_size: u64,
+    
+    /// Block size for delta calculation
+    #[prost(uint32, tag = "5")]
+    pub block_size: u32,
+    
+    /// List of local block hashes (rolling hash + strong hash)
+    #[prost(message, repeated, tag = "6")]
+    pub block_signatures: Vec<BlockSignature>,
+}
+
+/// Signature for a single block in delta sync
+#[derive(Clone, PartialEq, Message)]
+pub struct BlockSignature {
+    /// Block index
+    #[prost(uint64, tag = "1")]
+    pub block_index: u64,
+    
+    /// Weak/rolling hash (Adler32 or similar)
+    #[prost(uint32, tag = "2")]
+    pub weak_hash: u32,
+    
+    /// Strong hash (BLAKE3)
+    #[prost(bytes, tag = "3")]
+    pub strong_hash: Vec<u8>,
+}
+
+/// Response containing delta/patch to apply
+#[derive(Clone, PartialEq, Message)]
+pub struct DeltaResponse {
+    /// Session ID
+    #[prost(string, tag = "1")]
+    pub session_id: String,
+    
+    /// Whether delta can be applied (or full file needed)
+    #[prost(bool, tag = "2")]
+    pub can_delta: bool,
+    
+    /// Delta operations to apply
+    #[prost(message, repeated, tag = "3")]
+    pub delta_ops: Vec<DeltaOperation>,
+    
+    /// Total size of delta
+    #[prost(uint64, tag = "4")]
+    pub delta_size: u64,
+    
+    /// Remote file hash after applying delta
+    #[prost(bytes, tag = "5")]
+    pub remote_file_hash: Vec<u8>,
+}
+
+/// A single delta operation (copy existing or insert new data)
+#[derive(Clone, PartialEq, Message)]
+pub struct DeltaOperation {
+    /// Operation type: 0=Copy from local, 1=Insert new data
+    #[prost(uint32, tag = "1")]
+    pub op_type: u32,
+    
+    /// For Copy: source offset in local file
+    #[prost(uint64, optional, tag = "2")]
+    pub source_offset: Option<u64>,
+    
+    /// For Copy: length to copy
+    #[prost(uint64, optional, tag = "3")]
+    pub copy_length: Option<u64>,
+    
+    /// For Insert: new data to insert
+    #[prost(bytes, optional, tag = "4")]
+    pub insert_data: Option<Vec<u8>>,
+    
+    /// Target offset in output file
+    #[prost(uint64, tag = "5")]
+    pub target_offset: u64,
+}
+
 /// Transfer state enumeration
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
 #[repr(i32)]
@@ -379,12 +471,57 @@ impl StatusUpdate {
     }
 }
 
+impl HashCheckResponse {
+    /// Encode to bytes
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.reserve(self.encoded_len());
+        self.encode(&mut buf).expect("Failed to encode HashCheckResponse");
+        buf
+    }
+    
+    /// Decode from bytes
+    pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, prost::DecodeError> {
+        Self::decode(bytes)
+    }
+}
+
 impl TransferComplete {
     /// Encode to bytes
     pub fn encode_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.reserve(self.encoded_len());
         self.encode(&mut buf).expect("Failed to encode TransferComplete");
+        buf
+    }
+    
+    /// Decode from bytes
+    pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, prost::DecodeError> {
+        Self::decode(bytes)
+    }
+}
+
+impl DeltaRequest {
+    /// Encode to bytes
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.reserve(self.encoded_len());
+        self.encode(&mut buf).expect("Failed to encode DeltaRequest");
+        buf
+    }
+    
+    /// Decode from bytes
+    pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, prost::DecodeError> {
+        Self::decode(bytes)
+    }
+}
+
+impl DeltaResponse {
+    /// Encode to bytes
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.reserve(self.encoded_len());
+        self.encode(&mut buf).expect("Failed to encode DeltaResponse");
         buf
     }
     
