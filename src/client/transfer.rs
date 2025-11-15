@@ -1062,7 +1062,15 @@ impl Transfer {
                     idle_iterations += 1;
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(e) => return Err(Error::from(e)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Treat timeout like WouldBlock during hash check wait
+                    idle_iterations += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    warn!("Client: unexpected error during hash check response wait: {}", e);
+                    return Err(Error::from(e));
+                }
             }
             
             if connection.is_closed() {

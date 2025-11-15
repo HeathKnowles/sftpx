@@ -498,7 +498,27 @@ impl TransferManager {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             
-            log::info!("Server: hash check response sent and flushed");
+            log::info!("Server: hash check response sent, flushing more aggressively...");
+            
+            // More aggressive flush to ensure response reaches client
+            let flush_start = std::time::Instant::now();
+            while flush_start.elapsed() < std::time::Duration::from_millis(500) {
+                // Send packets
+                if let Err(e) = connection.send_packets(socket, &mut out) {
+                    log::warn!("Server: error sending during hash check flush: {:?}", e);
+                }
+                
+                // Receive ACKs
+                socket.set_read_timeout(Some(std::time::Duration::from_millis(10)))?;
+                if let Ok((len, from)) = socket.recv_from(&mut buf) {
+                    let to = socket.local_addr()?;
+                    let _ = connection.process_packet(&mut buf[..len], from, to);
+                }
+                
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            
+            log::info!("Server: hash check response fully flushed");
         }
         
         // --- FILE RECEIVE PHASE ---
