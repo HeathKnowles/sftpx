@@ -1271,7 +1271,7 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_retries = 1000;
+        let max_retries = 5000;  // Increased from 1000 for slower networks
         let mut retry_count = 0;
         let mut consecutive_no_progress = 0;
         
@@ -1315,16 +1315,25 @@ impl Transfer {
             if written == before_written {
                 consecutive_no_progress += 1;
                 
-                // Only sleep if we've had multiple iterations with no progress
+                // Log flow control stalls periodically
+                if retry_count > 0 && retry_count % 1000 == 0 {
+                    warn!(
+                        "Client: flow control stalled - sent {}/{} bytes ({:.1}%), {} retries",
+                        written, data.len(), (written as f64 / data.len() as f64) * 100.0, retry_count
+                    );
+                }
+                
+                // Progressive backoff: sleep longer as consecutive failures increase
                 if consecutive_no_progress > 5 {
-                    std::thread::sleep(Duration::from_millis(1));
+                    let backoff_ms = std::cmp::min(consecutive_no_progress / 10, 10);
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                 }
                 
                 retry_count += 1;
                 if retry_count >= max_retries {
                     return Err(Error::Protocol(format!(
-                        "Flow control timeout: sent {}/{} bytes after {} retries",
-                        written, data.len(), max_retries
+                        "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} retries",
+                        written, data.len(), (written as f64 / data.len() as f64) * 100.0, max_retries
                     )));
                 }
             } else {
