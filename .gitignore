@@ -1,2 +1,13 @@
-target/*
+target/
 Cargo.lock
+*.bin
+*.json
+*.log
+*.txt
+*.mkv
+*.mp4
+LICENSE
+tests/
+tmp/
+received/
+
