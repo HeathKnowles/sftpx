@@ -14,7 +14,8 @@ pub const STREAM_MANIFEST: u64 = 4;    // Client-initiated bidirectional - File 
 pub const STREAM_DATA: u64 = 8;        // Client-initiated bidirectional - File data chunks
 pub const STREAM_STATUS: u64 = 12;     // Client-initiated bidirectional - Transfer status updates
 pub const STREAM_HASH_CHECK: u64 = 16; // Client-initiated bidirectional - Hash check requests/responses (changed from 1)
-pub const STREAM_RESUME: u64 = 20;     // Client-initiated bidirectional - Resume requests/responses
+pub const STREAM_RESUME: u64 = 20;    // Client-initiated bidirectional - Resume requests
+#[allow(dead_code)]
 pub const STREAM_DELTA: u64 = 5;       // Server-initiated bidirectional - Delta sync requests/patches
 
 pub struct StreamManager {
@@ -23,10 +24,17 @@ pub struct StreamManager {
 
 #[derive(Debug, Clone)]
 struct StreamInfo {
+    #[allow(dead_code)]
     stream_id: u64,
+    #[allow(dead_code)]
+    stream_type: StreamType,
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     is_finished: bool,
+    #[allow(dead_code)]
     bytes_sent: u64,
+    #[allow(dead_code)]
     bytes_received: u64,
 }
 
@@ -37,6 +45,7 @@ impl StreamManager {
         // Pre-register the 4 streams
         streams.insert(STREAM_CONTROL, StreamInfo {
             stream_id: STREAM_CONTROL,
+            stream_type: StreamType::Control,
             name: "control".to_string(),
             is_finished: false,
             bytes_sent: 0,
@@ -45,6 +54,7 @@ impl StreamManager {
         
         streams.insert(STREAM_MANIFEST, StreamInfo {
             stream_id: STREAM_MANIFEST,
+            stream_type: StreamType::Manifest,
             name: "manifest".to_string(),
             is_finished: false,
             bytes_sent: 0,
@@ -53,6 +63,7 @@ impl StreamManager {
         
         streams.insert(STREAM_DATA, StreamInfo {
             stream_id: STREAM_DATA,
+            stream_type: StreamType::Data,
             name: "data".to_string(),
             is_finished: false,
             bytes_sent: 0,
@@ -61,6 +72,7 @@ impl StreamManager {
         
         streams.insert(STREAM_STATUS, StreamInfo {
             stream_id: STREAM_STATUS,
+            stream_type: StreamType::Status,
             name: "status".to_string(),
             is_finished: false,
             bytes_sent: 0,

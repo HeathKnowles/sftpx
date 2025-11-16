@@ -2,8 +2,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver};
 use rayon::prelude::*;
 use crate::common::error::{Error, Result};
 use crate::common::types::DEFAULT_CHUNK_SIZE;
@@ -35,6 +34,7 @@ pub struct ParallelChunker {
     chunk_size: usize,
     compression: CompressionType,
     total_chunks: u64,
+    #[allow(dead_code)]
     worker_threads: usize,
     pipeline_depth: usize,
 }

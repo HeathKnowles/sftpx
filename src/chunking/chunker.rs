@@ -144,7 +144,7 @@ impl FileChunker {
     }
 
     /// Create an iterator over all chunks
-    pub fn iter(&mut self) -> ChunkIterator {
+    pub fn iter(&mut self) -> ChunkIterator<'_> {
         ChunkIterator { chunker: self }
     }
 }

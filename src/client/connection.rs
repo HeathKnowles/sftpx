@@ -1,4 +1,5 @@
 // Client connection management
+#[allow(dead_code)]
 
 use quiche;
 use std::net::SocketAddr;
@@ -11,6 +12,7 @@ use crate::common::types::*;
 pub struct ClientConnection {
     conn: quiche::Connection,
     socket_addr: SocketAddr,
+    
     server_name: String,
     last_activity: Instant,
     last_heartbeat: Instant,

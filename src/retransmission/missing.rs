@@ -1,6 +1,6 @@
 // Track missing chunks and manage retransmission requests
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Tracks missing chunks and manages retransmission requests

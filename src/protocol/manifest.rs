@@ -2,9 +2,7 @@
 
 use crate::common::error::{Error, Result};
 use crate::protocol::messages::Manifest;
-use crate::chunking::hasher::ChunkHasher;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Default chunk size (1 MB)

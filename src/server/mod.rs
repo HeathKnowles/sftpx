@@ -16,6 +16,7 @@ use quiche::Config;
 use std::net::UdpSocket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+#[allow(dead_code)]
 const NUM_STREAMS_PER_CONNECTION: usize = 4;
 
 /// Server configuration
@@ -45,6 +46,7 @@ impl Default for ServerConfig {
 
 /// Main QUIC server
 pub struct Server {
+    #[allow(dead_code)]
     config: ServerConfig,
     socket: UdpSocket,
     quic_config: Config,
