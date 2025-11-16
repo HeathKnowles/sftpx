@@ -17,6 +17,7 @@ use crate::protocol::hash_check::{HashCheckRequestSender, HashCheckResponseRecei
 use crate::protocol::resume::{ResumeRequestSender, ResumeResponseReceiver};
 use crate::chunking::ChunkBitmap;
 use super::session::ClientSession;
+use std::collections::HashMap;
 
 pub struct Transfer {
     config: ClientConfig,
@@ -25,6 +26,7 @@ pub struct Transfer {
     session: Option<ClientSession>,
     socket: Option<UdpSocket>,
     state: TransferState,
+    resume_bitmaps: HashMap<String, ChunkBitmap>,  // In-memory bitmap storage by session_id
 }
 
 impl Transfer {
@@ -49,6 +51,7 @@ impl Transfer {
             session: Some(session),
             socket: None,
             state: TransferState::Initializing,
+            resume_bitmaps: HashMap::new(),
         })
     }
     
@@ -62,6 +65,7 @@ impl Transfer {
             session: Some(session),
             socket: None,
             state: TransferState::Initializing,
+            resume_bitmaps: HashMap::new(),
         })
     }
     
@@ -76,6 +80,7 @@ impl Transfer {
             session: Some(session),
             socket: None,
             state: TransferState::Resuming,
+            resume_bitmaps: HashMap::new(),
         })
     }
     
@@ -750,32 +755,28 @@ impl Transfer {
     ) -> Result<std::collections::HashSet<u64>> {
         use std::collections::HashSet;
         
-        // Check if we have a saved bitmap from a previous interrupted transfer
-        let bitmap_path = self.get_resume_bitmap_path(&manifest.session_id);
-        
-        if !bitmap_path.exists() {
-            info!("Client: no saved bitmap found, starting fresh transfer");
+        // Check if we have a saved bitmap in memory from a previous interrupted transfer
+        let bitmap = if let Some(saved_bitmap) = self.resume_bitmaps.get(&manifest.session_id) {
+            info!("Client: found saved bitmap in memory, attempting resume...");
+            info!("Client: loaded bitmap with {} chunks received", saved_bitmap.received_count());
+            
+            // Create a copy for use
+            let total_chunks = saved_bitmap.total_chunks().unwrap_or(0);
+            let mut bitmap_copy = ChunkBitmap::with_exact_size(total_chunks);
+            for i in 0..total_chunks {
+                if saved_bitmap.is_received(i) {
+                    bitmap_copy.mark_received(i, saved_bitmap.is_complete() && i == total_chunks - 1);
+                }
+            }
+            bitmap_copy
+        } else {
+            info!("Client: no saved bitmap found in memory, starting fresh transfer");
             return Ok(HashSet::new());
-        }
-        
-        info!("Client: found saved bitmap, attempting resume...");
-        
-        // Load bitmap from disk
-        let bitmap = match ChunkBitmap::load_from_disk(&bitmap_path) {
-            Ok(bm) => {
-                info!("Client: loaded bitmap with {} chunks received", bm.received_count());
-                bm
-            }
-            Err(e) => {
-                warn!("Client: failed to load bitmap: {}, starting fresh", e);
-                return Ok(HashSet::new());
-            }
         };
         
         // Don't resume if no progress was made
         if bitmap.received_count() == 0 {
             info!("Client: bitmap shows no progress, starting fresh");
-            std::fs::remove_file(&bitmap_path).ok();
             return Ok(HashSet::new());
         }
         
@@ -801,7 +802,6 @@ impl Transfer {
         
         if let Err(e) = send_result {
             warn!("Client: failed to send resume request: {}, starting fresh", e);
-            std::fs::remove_file(&bitmap_path).ok();
             return Ok(HashSet::new());
         }
         
@@ -870,7 +870,6 @@ impl Transfer {
                                         skip_chunks.len(), response.missing_chunks.len());
                                 } else {
                                     warn!("Client: resume rejected by server: {:?}", response.error);
-                                    std::fs::remove_file(&bitmap_path).ok();
                                 }
                                 received_response = true;
                                 break;
@@ -897,25 +896,30 @@ impl Transfer {
         
         if !received_response {
             warn!("Client: no resume response received, starting fresh");
-            std::fs::remove_file(&bitmap_path).ok();
             return Ok(HashSet::new());
         }
         
         Ok(skip_chunks)
     }
     
-    /// Get the path to the resume bitmap file for a session
-    fn get_resume_bitmap_path(&self, session_id: &str) -> PathBuf {
-        PathBuf::from(&self.config.session_dir)
-            .join(format!("{}.bitmap", session_id))
-    }
-    
-    /// Save bitmap for resume capability
-    fn save_resume_bitmap(&self, session_id: &str, bitmap: &ChunkBitmap) -> Result<()> {
-        let path = self.get_resume_bitmap_path(session_id);
-        bitmap.save_to_disk(&path)
-            .map_err(|e| Error::Io(e))?;
-        debug!("Client: saved resume bitmap to {:?}", path);
+    /// Save bitmap for resume capability (in-memory)
+    fn save_resume_bitmap(&mut self, session_id: &str, bitmap: &ChunkBitmap) -> Result<()> {
+        // Get bitmap properties
+        let total_chunks = bitmap.total_chunks().unwrap_or(0);
+        let received_count = bitmap.received_count();
+        let have_eof = bitmap.is_complete();
+        
+        // Create new bitmap and copy received chunks
+        let mut new_bitmap = ChunkBitmap::with_exact_size(total_chunks);
+        for i in 0..total_chunks {
+            if bitmap.is_received(i) {
+                new_bitmap.mark_received(i, have_eof && i == total_chunks - 1);
+            }
+        }
+        
+        self.resume_bitmaps.insert(session_id.to_string(), new_bitmap);
+        debug!("Client: saved resume bitmap to memory for session {} ({}/{} chunks)", 
+            session_id, received_count, total_chunks);
         Ok(())
     }
     
@@ -1246,14 +1250,9 @@ impl Transfer {
         
         info!("Client: file upload complete ({} bytes sent)", bytes_sent);
         
-        // Delete bitmap file after successful transfer
-        let bitmap_path = self.get_resume_bitmap_path(&manifest.session_id);
-        if bitmap_path.exists() {
-            if let Err(e) = std::fs::remove_file(&bitmap_path) {
-                warn!("Client: failed to delete bitmap file: {}", e);
-            } else {
-                debug!("Client: deleted resume bitmap file");
-            }
+        // Remove bitmap from memory after successful transfer
+        if self.resume_bitmaps.remove(&manifest.session_id).is_some() {
+            debug!("Client: removed resume bitmap from memory after successful transfer");
         }
         
         Ok(bytes_sent)
