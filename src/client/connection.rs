@@ -13,6 +13,7 @@ pub struct ClientConnection {
     conn: quiche::Connection,
     socket_addr: SocketAddr,
     
+    #[allow(dead_code)]
     server_name: String,
     last_activity: Instant,
     last_heartbeat: Instant,

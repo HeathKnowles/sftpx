@@ -21,9 +21,11 @@ use std::collections::HashMap;
 
 pub struct Transfer {
     config: ClientConfig,
+    #[allow(dead_code)]
     connection: Option<ClientConnection>,
     stream_manager: StreamManager,
     session: Option<ClientSession>,
+    #[allow(dead_code)]
     socket: Option<UdpSocket>,
     state: TransferState,
     resume_bitmaps: HashMap<String, ChunkBitmap>,  // In-memory bitmap storage by session_id
@@ -1453,6 +1455,7 @@ impl Transfer {
     }
     
     /// Helper: Send multiple chunks in a pipeline for better throughput
+    #[allow(dead_code)]
     fn send_pipelined_chunks(
         &self,
         connection: &mut ClientConnection,
@@ -1544,6 +1547,7 @@ impl Transfer {
     }
     
     /// Helper: Send data with flow control handling
+    #[allow(dead_code)]
     fn send_data_with_flow_control(
         &self,
         connection: &mut ClientConnection,
