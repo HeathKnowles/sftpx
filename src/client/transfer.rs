@@ -1332,26 +1332,52 @@ impl Transfer {
         let mut written = 0;
         socket.set_nonblocking(true).ok();
         
-        // Write data to stream buffer
+        let mut stall_iterations = 0;
+        
+        // Write data to stream buffer and ensure it gets sent
         while written < data.len() {
+            let prev_written = written;
+            
+            // Write to stream
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
-                Ok(w) if w > 0 => written += w,
-                Ok(_) => break,
-                Err(ref e) if format!("{:?}", e).contains("Done") => break,
+                Ok(w) if w > 0 => {
+                    written += w;
+                    stall_iterations = 0;
+                }
+                Ok(_) => {}
+                Err(ref e) if format!("{:?}", e).contains("Done") => {}
                 Err(e) => return Err(e),
             }
             
-            // Quick flush and receive cycle
-            for _ in 0..3 {
-                // Send packets
-                if let Ok((len, send_info)) = connection.send(out) {
-                    let _ = socket.send_to(&out[..len], send_info.to);
+            // Flush packets
+            loop {
+                match connection.send(out) {
+                    Ok((len, send_info)) => {
+                        if let Ok(_) = socket.send_to(&out[..len], send_info.to) {
+                            stall_iterations = 0;
+                        }
+                    }
+                    Err(_) => break,
                 }
-                
-                // Receive ACKs
+            }
+            
+            // Receive ACKs
+            for _ in 0..5 {
                 if let Ok((len, from)) = socket.recv_from(buf) {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = connection.recv(&mut buf[..len], recv_info);
+                    stall_iterations = 0;
+                }
+            }
+            
+            // If stalled, yield briefly
+            if written == prev_written {
+                stall_iterations += 1;
+                if stall_iterations > 100 {
+                    std::thread::sleep(Duration::from_micros(50));
+                    stall_iterations = 0;
+                } else if stall_iterations > 20 {
+                    std::thread::yield_now();
                 }
             }
         }
