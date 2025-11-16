@@ -1328,11 +1328,11 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_iterations = 1_000_000;
+        let max_iterations = 10_000_000;  // 10 million iterations - very high limit
         let mut iterations = 0;
         let mut consecutive_no_progress = 0;
         let start_time = std::time::Instant::now();
-        let max_duration = Duration::from_secs(120);
+        let max_duration = Duration::from_secs(300);  // 5 minutes timeout
         
         while written < data.len() {
             let before_written = written;
@@ -1373,13 +1373,13 @@ impl Transfer {
                 }
             }
             
-            // Progress tracking
+            // Progress tracking - only sleep after many iterations with zero activity
             if written == before_written {
                 consecutive_no_progress += 1;
                 
-                // Yield when stuck with no network activity
-                if consecutive_no_progress > 1000 && !sent_packet && !received_ack {
-                    std::thread::sleep(Duration::from_micros(5));
+                // Only yield after significant stall with zero network activity
+                if consecutive_no_progress > 5000 && !sent_packet && !received_ack {
+                    std::thread::sleep(Duration::from_micros(1));
                     consecutive_no_progress = 0;
                 } else if sent_packet || received_ack {
                     consecutive_no_progress = 0;
@@ -1387,6 +1387,14 @@ impl Transfer {
             }
             
             iterations += 1;
+            
+            // Log progress every 1 million iterations
+            if iterations % 1_000_000 == 0 {
+                debug!("Flow control: {} iterations, {}/{} bytes ({:.1}%), {:.1}s elapsed",
+                    iterations, written, data.len(), 
+                    (written as f64 / data.len() as f64) * 100.0,
+                    start_time.elapsed().as_secs_f64());
+            }
             
             if start_time.elapsed() > max_duration {
                 return Err(Error::Protocol(format!(
