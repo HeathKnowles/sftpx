@@ -1032,10 +1032,14 @@ impl Transfer {
         
         debug!("Client: waiting for hash check response on stream {}...", STREAM_HASH_CHECK);
         
+        let start_time = std::time::Instant::now();
+        
         while !received_response && idle_iterations < MAX_IDLE {
             // Flush outgoing packets
+            let mut sent_packets = 0;
             while let Ok((write, send_info)) = connection.send(out) {
                 socket.send_to(&out[..write], send_info.to)?;
+                sent_packets += 1;
                 idle_iterations = 0;
             }
             
@@ -1053,9 +1057,11 @@ impl Transfer {
                     // Check for hash check response on STREAM_HASH_CHECK
                     while let Ok((read, fin)) = connection.stream_recv(STREAM_HASH_CHECK, &mut buf[..]) {
                         if read > 0 {
+                            debug!("Client: received {} bytes on hash check stream", read);
                             if let Some(response) = response_receiver.receive_chunk(&buf[..read], fin)? {
                                 existing_hashes = response.existing_hashes;
                                 received_response = true;
+                                info!("Client: hash check response received with {} existing chunks", existing_hashes.len());
                                 break;
                             }
                         }
@@ -1077,6 +1083,12 @@ impl Transfer {
                     warn!("Client: unexpected error during hash check response wait: {}", e);
                     return Err(Error::from(e));
                 }
+            }
+            
+            // Log progress every second
+            if idle_iterations % 100 == 0 && idle_iterations > 0 {
+                debug!("Client: hash check waiting... {:.1}s elapsed, {} packets sent recently", 
+                    start_time.elapsed().as_secs_f64(), sent_packets);
             }
             
             if connection.is_closed() {
@@ -1288,9 +1300,11 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_iterations = 100000;  // Higher limit for non-blocking operation
+        let max_iterations = 1_000_000;  // Much higher limit - 1 million iterations
         let mut iterations = 0;
         let mut consecutive_no_progress = 0;
+        let start_time = std::time::Instant::now();
+        let max_duration = Duration::from_secs(120); // 2 minute absolute timeout
         
         while written < data.len() {
             let before_written = written;
@@ -1311,42 +1325,59 @@ impl Transfer {
             }
             
             // Flush packets - send everything available
+            let mut sent_packet = false;
             while let Ok((len, send_info)) = connection.send(out) {
                 match socket.send_to(&out[..len], send_info.to) {
-                    Ok(_) => {},
+                    Ok(_) => { sent_packet = true; },
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(Error::from(e)),
                 }
             }
             
             // Try to receive ACKs - non-blocking
+            let mut received_ack = false;
             match socket.recv_from(buf) {
                 Ok((len, from)) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = connection.recv(&mut buf[..len], recv_info);
-                    consecutive_no_progress = 0;
+                    received_ack = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => return Err(Error::from(e)),
             }
             
-            // Check if we made any progress
+            // Check if we made any progress (sending data OR network activity)
             if written == before_written {
                 consecutive_no_progress += 1;
                 
-                // If stuck for a while, yield to prevent CPU spinning
-                if consecutive_no_progress > 100 {
-                    std::thread::sleep(Duration::from_micros(10));
+                // If stuck with no network activity, yield to prevent CPU spinning
+                if consecutive_no_progress > 100 && !sent_packet && !received_ack {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                
+                // Reset counter if there's any network activity even without send progress
+                if sent_packet || received_ack {
                     consecutive_no_progress = 0;
                 }
             }
             
             iterations += 1;
+            
+            // Check absolute timeout
+            if start_time.elapsed() > max_duration {
+                return Err(Error::Protocol(format!(
+                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {:.1}s",
+                    written, data.len(), (written as f64 / data.len() as f64) * 100.0,
+                    start_time.elapsed().as_secs_f64()
+                )));
+            }
+            
             if iterations >= max_iterations {
                 return Err(Error::Protocol(format!(
-                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} iterations",
-                    written, data.len(), (written as f64 / data.len() as f64) * 100.0, max_iterations
+                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} iterations ({:.1}s)",
+                    written, data.len(), (written as f64 / data.len() as f64) * 100.0, 
+                    max_iterations, start_time.elapsed().as_secs_f64()
                 )));
             }
         }
