@@ -12,3 +12,4 @@ Cargo.lock
 *.avi
 *.part
 .sftpx
+*.bitmap
