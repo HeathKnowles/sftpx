@@ -725,6 +725,12 @@ impl Transfer {
         info!("Client: manifest sent ({} bytes)", total_sent);
         
         // Phase 3: Hash check on dedicated server-initiated stream (STREAM_HASH_CHECK)
+        // SKIP hash check for maximum performance - proceed directly to upload
+        info!("Client: skipping hash check for maximum performance");
+        let existing_hashes = vec![];
+        
+        /*
+        // Original hash check code - disabled for performance
         info!("Client: performing hash check for deduplication");
         
         let chunk_hashes: Vec<Vec<u8>> = manifest.chunk_hashes.clone();
@@ -737,6 +743,7 @@ impl Transfer {
             &session_id,
             chunk_hashes,
         )?;
+        */
         
         info!("Client: hash check complete, {} chunks already exist", existing_hashes.len());
         
@@ -926,6 +933,7 @@ impl Transfer {
     }
     
     /// Hash check phase - check which chunks already exist on server
+    #[allow(dead_code)]
     fn hash_check_phase(
         &mut self,
         socket: &UdpSocket,
@@ -1159,6 +1167,9 @@ impl Transfer {
         // Create bitmap for tracking sent chunks (for resume capability)
         let mut sent_bitmap = ChunkBitmap::with_exact_size(total_chunks as u32);
         
+        // Track performance
+        let start_time = std::time::Instant::now();
+        
         // Mark skipped chunks as already sent
         for &chunk_idx in skip_chunks {
             if chunk_idx < total_chunks {
@@ -1224,10 +1235,27 @@ impl Transfer {
             }
             
             if chunk_count % 50 == 0 || is_last {
-                info!("Client: sent chunk {}/{} ({:.1}%)", 
-                    chunk_count, total_chunks, (chunk_count as f64 / total_chunks as f64) * 100.0);
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let speed_mbps = if elapsed > 0.0 {
+                    (bytes_sent as f64 / elapsed) / (1024.0 * 1024.0)
+                } else {
+                    0.0
+                };
+                info!("Client: sent chunk {}/{} ({:.1}%) - {:.2} MB/s", 
+                    chunk_count, total_chunks, 
+                    (chunk_count as f64 / total_chunks as f64) * 100.0,
+                    speed_mbps);
             }
         }
+        
+        let total_elapsed = start_time.elapsed().as_secs_f64();
+        let avg_speed_mbps = if total_elapsed > 0.0 {
+            (bytes_sent as f64 / total_elapsed) / (1024.0 * 1024.0)
+        } else {
+            0.0
+        };
+        
+        info!("Client: average upload speed: {:.2} MB/s", avg_speed_mbps);
         
         if chunks_skipped > 0 {
             info!("Client: deduplication saved {} chunks ({:.1}%)", 

@@ -2,8 +2,7 @@
 # Generate self-signed certificates with IP address support
 # Usage: ./generate_certs_with_ip.sh <server_ip>
 
-SERVER_IP=${1:-"192.168.8.56"}
-
+SERVER_IP=${1:-"10.149.129.191"}
 echo "Generating certificates for IP: $SERVER_IP"
 
 mkdir -p certs
