@@ -18,37 +18,37 @@ enum Commands {
     /// Send a file to a remote server
     Send {
         /// File to send
-        #[arg(short, long)]
+        #[arg(long)]
         file: String,
         
         /// Destination path on server
-        #[arg(short, long)]
+        #[arg(long)]
         destination: String,
         
         /// Server address (e.g., 127.0.0.1:4433)
-        #[arg(short, long)]
+        #[arg(long)]
         server: String,
     },
     
     /// Receive a file from a server
     Recv {
         /// Session ID to resume
-        #[arg(short, long)]
+        #[arg(long)]
         session_id: String,
         
         /// Server address (e.g., 127.0.0.1:4433)
-        #[arg(short, long)]
+        #[arg(long)]
         server: String,
     },
     
     /// Resume a transfer
     Resume {
         /// Session ID to resume
-        #[arg(short, long)]
+        #[arg(long)]
         session_id: String,
         
         /// Server address (e.g., 127.0.0.1:4433)
-        #[arg(short, long)]
+        #[arg(long)]
         server: String,
     },
 }

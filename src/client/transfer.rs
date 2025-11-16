@@ -762,8 +762,11 @@ impl Transfer {
     ) -> Result<std::collections::HashSet<u64>> {
         use std::collections::HashSet;
         
-        // Check if we have a saved bitmap in memory from a previous interrupted transfer
-        let bitmap = if let Some(saved_bitmap) = self.resume_bitmaps.get(&manifest.session_id) {
+        // Check for existing resume bitmap (load from disk first, then memory)
+        let bitmap = if let Ok(disk_bitmap) = self.load_resume_bitmap(&manifest.session_id) {
+            info!("Client: found resume bitmap on disk with {} chunks received", disk_bitmap.received_count());
+            disk_bitmap
+        } else if let Some(saved_bitmap) = self.resume_bitmaps.get(&manifest.session_id) {
             info!("Client: found saved bitmap in memory, attempting resume...");
             info!("Client: loaded bitmap with {} chunks received", saved_bitmap.received_count());
             
@@ -777,7 +780,7 @@ impl Transfer {
             }
             bitmap_copy
         } else {
-            info!("Client: no saved bitmap found in memory, starting fresh transfer");
+            info!("Client: no saved bitmap found, starting fresh transfer");
             return Ok(HashSet::new());
         };
         
@@ -909,7 +912,7 @@ impl Transfer {
         Ok(skip_chunks)
     }
     
-    /// Save bitmap for resume capability (in-memory) - optimized to reuse existing bitmap
+    /// Save bitmap for resume capability (to disk AND memory)
     fn save_resume_bitmap(&mut self, session_id: &str, bitmap: &ChunkBitmap) -> Result<()> {
         let total_chunks = bitmap.total_chunks().unwrap_or(0);
         
@@ -918,8 +921,7 @@ impl Transfer {
             .entry(session_id.to_string())
             .or_insert_with(|| ChunkBitmap::with_exact_size(total_chunks));
         
-        // Only copy the new received chunks (last chunk since last save)
-        // Since we save every 100 chunks, we only need to update the last few
+        // Update in-memory bitmap
         let received_count = bitmap.received_count();
         for i in (received_count.saturating_sub(100))..total_chunks {
             if bitmap.is_received(i) && !stored_bitmap.is_received(i) {
@@ -927,9 +929,32 @@ impl Transfer {
             }
         }
         
-        debug!("Client: updated resume bitmap in memory for session {} ({}/{} chunks)", 
+        // Save to disk in .sftpx_resume directory
+        let resume_dir = std::path::PathBuf::from(".sftpx_resume");
+        if !resume_dir.exists() {
+            std::fs::create_dir_all(&resume_dir)?;
+        }
+        
+        let bitmap_path = resume_dir.join(format!("{}.bitmap", session_id));
+        bitmap.save_to_disk(&bitmap_path)?;
+        
+        debug!("Client: saved resume bitmap to disk and memory for session {} ({}/{} chunks)", 
             session_id, bitmap.received_count(), total_chunks);
         Ok(())
+    }
+    
+    /// Load bitmap from disk for resume capability
+    fn load_resume_bitmap(&self, session_id: &str) -> Result<ChunkBitmap> {
+        let resume_dir = std::path::PathBuf::from(".sftpx_resume");
+        let bitmap_path = resume_dir.join(format!("{}.bitmap", session_id));
+        
+        if bitmap_path.exists() {
+            info!("Client: loading resume bitmap from disk: {:?}", bitmap_path);
+            ChunkBitmap::load_from_disk(&bitmap_path)
+                .map_err(|e| Error::Io(e))
+        } else {
+            Err(Error::Protocol(format!("No resume bitmap found for session {}", session_id)))
+        }
     }
     
     /// Hash check phase - check which chunks already exist on server
