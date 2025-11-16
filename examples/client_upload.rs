@@ -50,12 +50,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let config = ClientConfig::new(server_addr, server_name)
         .disable_cert_verification()  // Skip cert verification for testing
-        .with_chunk_size(4194304)?    // 4 MB chunks for high-speed networks
+        .with_chunk_size(2097152)?    // 2 MB chunks - balanced
         .with_compression(CompressionType::None);  // Disable compression for max speed
     
     println!("Client Configuration:");
     println!("  Server: {}", server_addr);
-    println!("  Chunk Size: {} bytes ({} MB - optimized for high-speed)", config.chunk_size, config.chunk_size / (1024*1024));
+    println!("  Chunk Size: {} bytes ({} MB)", config.chunk_size, config.chunk_size / (1024*1024));
     println!("  Compression: {:?} (disabled for max speed)", config.compression);
     println!("\nFeatures:");
     println!("  ✓ Integrated orchestration (handshake → manifest → chunks)");

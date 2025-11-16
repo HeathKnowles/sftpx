@@ -60,10 +60,9 @@ impl ClientConnection {
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(false);
         
-        // High-speed network optimizations
-        quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::BBR);  // BBR for high-bandwidth
-        quic_config.enable_pacing(false);  // Disable pacing for maximum burst speed
-        quic_config.enable_hystart(true);  // Enable HyStart for faster ramp-up
+        // Balanced performance tuning
+        quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
+        quic_config.enable_hystart(true);  // Faster ramp-up
         
         // TLS verification
         if !config.verify_cert {

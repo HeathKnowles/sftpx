@@ -1028,7 +1028,7 @@ impl Transfer {
         let mut received_response = false;
         let mut existing_hashes = vec![];
         let mut idle_iterations = 0;
-        const MAX_IDLE: usize = 200;  // 200 * 10ms = 2 seconds - faster timeout for high-speed networks
+        const MAX_IDLE: usize = 500;  // 500 * 10ms = 5 seconds
         
         debug!("Client: waiting for hash check response on stream {}...", STREAM_HASH_CHECK);
         
@@ -1330,9 +1330,9 @@ impl Transfer {
                 }
             }
             
-            // Receive ACKs - read multiple packets per iteration for better throughput
+            // Receive ACKs - read multiple packets per iteration
             let mut received_ack = false;
-            for _ in 0..20 {  // Read up to 20 packets for high-speed networks
+            for _ in 0..10 {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
@@ -1349,9 +1349,9 @@ impl Transfer {
             if written == before_written {
                 consecutive_no_progress += 1;
                 
-                // Yield only when truly stuck with no network activity
-                if consecutive_no_progress > 2000 && !sent_packet && !received_ack {
-                    std::thread::sleep(Duration::from_micros(1));  // Minimal sleep
+                // Yield when stuck with no network activity
+                if consecutive_no_progress > 1000 && !sent_packet && !received_ack {
+                    std::thread::sleep(Duration::from_micros(5));
                     consecutive_no_progress = 0;
                 } else if sent_packet || received_ack {
                     consecutive_no_progress = 0;
