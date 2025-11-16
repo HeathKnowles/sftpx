@@ -1334,24 +1334,30 @@ impl Transfer {
         // Set socket to non-blocking for efficient I/O
         socket.set_nonblocking(true).ok();
         
+        let mut stall_count = 0;
+        
         while written < data.len() {
-            // Try to write to stream
-            match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
-                Ok(w) if w > 0 => {
-                    written += w;
+            let before_written = written;
+            
+            // Try to write to stream - keep trying until we can't write more
+            loop {
+                match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
+                    Ok(w) if w > 0 => {
+                        written += w;
+                        stall_count = 0;
+                    }
+                    Ok(_) => break,
+                    Err(ref e) if format!("{:?}", e).contains("Done") => break,
+                    Err(e) => return Err(e),
                 }
-                Ok(_) => {}
-                Err(ref e) if format!("{:?}", e).contains("Done") => {}
-                Err(e) => return Err(e),
             }
             
-            // Flush packets - send all available
-            let mut packets_sent = 0;
+            // Flush packets - send all available aggressively
             loop {
                 match connection.send(out) {
                     Ok((len, send_info)) => {
                         match socket.send_to(&out[..len], send_info.to) {
-                            Ok(_) => { packets_sent += 1; },
+                            Ok(_) => {},
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) => return Err(Error::from(e)),
                         }
@@ -1360,29 +1366,26 @@ impl Transfer {
                 }
             }
             
-            // Receive ACKs - drain all available packets
-            let mut acks_received = 0;
+            // Receive ACKs - drain all available packets aggressively
             loop {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
                         let _ = connection.recv(&mut buf[..len], recv_info);
-                        acks_received += 1;
+                        stall_count = 0;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
             }
             
-            // Minimal sleep to prevent CPU spinning while letting congestion control work
-            if written < data.len() {
-                // Still have data to send - minimal delay
-                if packets_sent == 0 && acks_received == 0 {
-                    // Completely stalled - wait for network activity
-                    std::thread::sleep(Duration::from_micros(50));
-                } else {
-                    // Active transfer - just yield
-                    std::thread::yield_now();
+            // Only sleep if we're completely stalled for multiple iterations
+            if written == before_written {
+                stall_count += 1;
+                if stall_count > 100 {
+                    // Genuinely stalled - tiny sleep
+                    std::thread::sleep(Duration::from_micros(10));
+                    stall_count = 0;
                 }
             }
             
