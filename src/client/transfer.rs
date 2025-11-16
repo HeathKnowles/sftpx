@@ -431,8 +431,9 @@ impl Transfer {
         info!("Client: waiting for handshake to complete...");
         
         let start_time = std::time::Instant::now();
-        let handshake_timeout = Duration::from_secs(10); // 10 second timeout for handshake
+        let handshake_timeout = Duration::from_secs(30); // 30 second timeout (increased for resume scenarios)
         let mut iterations = 0;
+        let mut last_log_time = start_time;
         
         loop {
             iterations += 1;
@@ -451,14 +452,14 @@ impl Transfer {
                 Ok((len, from)) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = connection.recv(&mut buf[..len], recv_info);
-                    if iterations % 10 == 0 {
-                        info!("Client: received packet during handshake (iteration {})", iterations);
-                    }
+                    last_log_time = std::time::Instant::now();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock ||
                           e.kind() == std::io::ErrorKind::TimedOut => {
-                    if iterations % 50 == 0 {
+                    // Log progress every 2 seconds
+                    if last_log_time.elapsed() >= Duration::from_secs(2) {
                         info!("Client: waiting for handshake... ({:.1}s elapsed)", start_time.elapsed().as_secs_f64());
+                        last_log_time = std::time::Instant::now();
                     }
                 }
                 Err(e) => return Err(Error::from(e)),
@@ -672,13 +673,17 @@ impl Transfer {
     ) -> Result<(u64, crate::protocol::messages::Manifest, Vec<Vec<u8>>)> {
         info!("Client: building manifest for upload...");
         
-        // Generate session ID
-        use std::time::SystemTime;
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let session_id = format!("upload_{}", timestamp);
+        // Generate deterministic session ID based on file path (for resume capability)
+        let file_name = file_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        
+        let abs_path = std::fs::canonicalize(file_path)
+            .unwrap_or_else(|_| file_path.to_path_buf());
+        let path_str = abs_path.to_string_lossy();
+        let hash = blake3::hash(path_str.as_bytes());
+        
+        let session_id = format!("upload_{}_{}", file_name, hex::encode(&hash.as_bytes()[..8]));
         
         // Build manifest using parallel hash computation for better performance
         let manifest = ManifestBuilder::new(session_id.clone())

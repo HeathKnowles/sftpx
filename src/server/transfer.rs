@@ -274,7 +274,7 @@ impl TransferManager {
         // Wait briefly for resume request
         let mut resume_request_receiver = ResumeRequestReceiver::new();
         let mut resume_iterations = 0;
-        const MAX_RESUME_WAIT: usize = 50;  // 50 * 10ms = 500ms
+        const MAX_RESUME_WAIT: usize = 20;  // 20 * 10ms = 200ms (reduced to avoid client timeout)
         
         while resume_iterations < MAX_RESUME_WAIT {
             // Process network I/O
