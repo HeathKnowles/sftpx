@@ -116,12 +116,14 @@ impl Server {
             println!("Server: sent handshake response");
 
             // Handle the connection session (this will complete handshake and handle data)
-            self.handle_session(&mut server_conn, &mut buf, &mut out)?;
+            match self.handle_session(&mut server_conn, &mut buf, &mut out) {
+                Ok(_) => println!("Server: session completed successfully"),
+                Err(e) => eprintln!("Server: session error: {:?}", e),
+            }
 
-            break; // Single connection demo
+            println!("Server: connection closed, ready for next connection\n");
+            // Continue loop to accept next connection
         }
-
-        Ok(())
     }
 
     /// Handle a complete session with a client
