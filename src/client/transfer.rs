@@ -1110,9 +1110,6 @@ impl Transfer {
         
         info!("Client: starting file chunk upload...");
         
-        // Set socket to non-blocking mode once for better performance
-        socket.set_nonblocking(true)?;
-        
         // Convert existing hashes to HashSet for efficient lookup
         let existing_set: HashSet<&[u8]> = existing_hashes.iter()
             .map(|v| v.as_slice())
@@ -1223,15 +1220,23 @@ impl Transfer {
             // Send any pending packets
             let mut sent_any = false;
             while let Ok((len, send_info)) = connection.send(out) {
-                socket.send_to(&out[..len], send_info.to)?;
-                sent_any = true;
+                match socket.send_to(&out[..len], send_info.to) {
+                    Ok(_) => { sent_any = true; },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,  // Ignore other errors during flush
+                }
             }
             
             // Receive ACKs
-            socket.set_read_timeout(Some(Duration::from_millis(10)))?;
-            if let Ok((len, from)) = socket.recv_from(buf) {
-                let recv_info = quiche::RecvInfo { from, to: local_addr };
-                let _ = connection.recv(&mut buf[..len], recv_info);
+            socket.set_read_timeout(Some(Duration::from_millis(10))).ok();
+            match socket.recv_from(buf) {
+                Ok((len, from)) => {
+                    let recv_info = quiche::RecvInfo { from, to: local_addr };
+                    let _ = connection.recv(&mut buf[..len], recv_info);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {},
+                Err(_) => {},  // Ignore errors during flush
             }
             
             // If nothing was sent, increment idle counter
@@ -1291,7 +1296,11 @@ impl Transfer {
             
             // Flush packets - send everything available
             while let Ok((len, send_info)) = connection.send(out) {
-                socket.send_to(&out[..len], send_info.to)?;
+                match socket.send_to(&out[..len], send_info.to) {
+                    Ok(_) => {},
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(Error::from(e)),
+                }
             }
             
             // Try to receive ACKs - truly non-blocking, no sleep

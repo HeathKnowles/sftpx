@@ -10,3 +10,5 @@ Cargo.lock
 *.json
 *.mkv
 *.avi
+*.part
+.sftpx
