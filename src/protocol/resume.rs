@@ -2,7 +2,6 @@
 
 use crate::protocol::messages::{ResumeRequest, ResumeResponse};
 use crate::common::error::{Error, Result};
-use prost::Message;
 
 /// Handles sending ResumeRequest messages
 pub struct ResumeRequestSender;

@@ -1,6 +1,7 @@
 // Main entry point for the application
 
 use clap::{Parser, Subcommand};
+use sftpx::common::cert_gen::generate_self_signed_cert;
 use sftpx::common::config::ClientConfig;
 use sftpx::client::transfer::Transfer;
 use sftpx::server::{Server, ServerConfig};
@@ -12,6 +13,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
 #[command(name = "sftpx")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "QUIC-based file transfer tool with auto-resume", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -38,6 +40,13 @@ enum Commands {
         /// Upload directory (default: ./uploads)
         #[arg(long, default_value = "./uploads")]
         upload_dir: String,
+    },
+    
+    /// Initialize certificates for QUIC connections
+    Init {
+        /// Server IP address for certificate SAN (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        ip: String,
     },
 }
 
@@ -84,6 +93,23 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     
     match cli.command {
+        Commands::Init { ip } => {
+            println!("=== SFTPX Certificate Initialization ===\n");
+            println!("Generating self-signed certificates for IP: {}", ip);
+            println!("Certificates will be saved to: certs/\n");
+            
+            match generate_self_signed_cert(&ip, None) {
+                Ok(()) => {
+                    println!("\n✅ Certificates initialized successfully!");
+                    println!("You can now run the server with: sftpx recv");
+                }
+                Err(e) => {
+                    eprintln!("\n❌ Certificate generation failed: {}", e);
+                    return Err(e.into());
+                }
+            }
+        }
+        
         Commands::Send { file, server } => {
             println!("=== SFTPX Client Upload ===\n");
             

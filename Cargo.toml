@@ -2,6 +2,13 @@
 name = "sftpx"
 version = "0.1.0"
 edition = "2021"
+authors = ["Heath Knowles"]
+description = "QUIC-based file transfer tool with auto-resume capability"
+license = "MIT"
+repository = "https://github.com/HeathKnowles/sftpx"
+readme = "README.md"
+keywords = ["quic", "file-transfer", "networking", "resume", "chunking"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 # QUIC transport
@@ -46,6 +53,11 @@ mio = { version = "1.0", features = ["os-poll", "net"] }
 
 # Utilities
 hex = "0.4"
+
+# Certificate generation
+rcgen = "0.13"
+rustls-pemfile = "2.2"
+time = { version = "0.3", features = ["std"] }
 
 # Async runtime (optional, for future async implementation)
 # tokio = { version = "1", features = ["full"] }

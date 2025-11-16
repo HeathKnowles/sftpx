@@ -1,23 +1,139 @@
-# SFTPX - QUIC-Based File Transfer with 4-Stream Architecture
+# SFTPX - QUIC-Based File Transfer with Auto-Resume
 
-A high-performance file transfer system built with QUIC protocol using the `quiche` crate, featuring a 4-stream architecture for efficient data transfer.
+A high-performance file transfer system built with QUIC protocol using the `quiche` crate, featuring integrated orchestration, automatic resume capability, and BLAKE3 integrity verification.
 
 ## Features
 
-✅ **Implemented:**
-- 4-stream QUIC architecture (Control, Data1, Data2, Data3)
-- Complete QUIC handshake and connection management
-- Stream priority management
-- Session persistence and resumption
-- Chunked file transfer
-- Comprehensive error handling
-- Modular architecture
+✅ **Core Features:**
+- QUIC-based transport with CUBIC congestion control
+- Integrated file transfer orchestration (handshake → manifest → chunks)
+- Automatic resume capability with persistent bitmaps
+- BLAKE3 integrity verification per chunk
+- 4 QUIC streams (Control, Manifest, Data, Status)
+- CLI tool with send/recv commands
+- Cross-platform certificate generation
 
-🔄 **In Progress:**
-- Server implementation
-- Protocol message definitions (Protobuf/FlatBuffers)
-- Multi-threaded stream handlers
-- Chunk validation and integrity checks
+## Quick Start
+
+### 1. Initialize Certificates
+
+First-time setup - generate TLS certificates for QUIC:
+
+```bash
+# Linux/macOS/Windows - works everywhere, no external dependencies
+sftpx init --ip 127.0.0.1
+
+# Or specify your server's IP for remote connections
+sftpx init --ip 192.168.1.100
+```
+
+This creates `certs/cert.pem` and `certs/key.pem` with Subject Alternative Names for localhost and your specified IP.
+
+**No external dependencies required** - certificate generation is built into the binary using native Rust cryptography.
+
+### 2. Start the Server
+
+```bash
+# Start receiver on default port (0.0.0.0:4443)
+sftpx recv
+
+# Or specify custom bind address and upload directory
+sftpx recv --bind 192.168.1.100:4443 --upload-dir ./uploads
+```
+
+### 3. Send a File
+
+```bash
+# Send to localhost
+sftpx send myfile.dat
+
+# Send to remote server
+sftpx send myfile.dat 192.168.1.100
+
+# Interrupt with Ctrl+C and resume automatically
+sftpx send myfile.dat  # Resume detected automatically
+```
+
+## CLI Commands
+
+### `sftpx init`
+Initialize TLS certificates for QUIC connections.
+
+```bash
+sftpx init --ip <server_ip>
+```
+
+**Options:**
+- `--ip <IP>` - Server IP address for certificate SAN (default: 127.0.0.1)
+
+**Example:**
+```bash
+sftpx init --ip 192.168.1.100
+```
+
+### `sftpx send`
+Send a file to a remote server with auto-resume.
+
+```bash
+sftpx send <file> [server]
+```
+
+**Arguments:**
+- `<file>` - File to send (required)
+- `[server]` - Server IP address (default: 127.0.0.1)
+
+**Features:**
+- Automatically detects interrupted transfers and resumes
+- Session ID based on file path (deterministic)
+- Resume bitmaps saved every 100 chunks in `sftpx_resume/`
+- Progress reporting during transfer
+
+**Example:**
+```bash
+sftpx send large_file.bin 192.168.1.100
+```
+
+### `sftpx recv`
+Start server to receive files.
+
+```bash
+sftpx recv [OPTIONS]
+```
+
+**Options:**
+- `--bind <ADDRESS>` - Bind address (default: 0.0.0.0:4443)
+- `--upload-dir <PATH>` - Upload directory (default: ./uploads)
+
+**Example:**
+```bash
+sftpx recv --bind 192.168.1.100:4443 --upload-dir /var/uploads
+```
+
+## Features in Detail
+
+### Auto-Resume Capability
+
+Transfer state is persisted to disk every 100 chunks:
+- Session ID: BLAKE3 hash of file path (deterministic)
+- Bitmap storage: `sftpx_resume/<session_id>.bitmap`
+- Automatic detection: Client checks for existing bitmaps on startup
+- Server cleanup: 200ms delay allows server to reset before reconnection
+
+### BLAKE3 Integrity
+
+Every chunk is verified with BLAKE3:
+- Computed during chunking
+- Transmitted in manifest
+- Verified on server before storage
+- Automatic retransmission on corruption
+
+### Migration Handling
+
+Server detects peer address changes and handles gracefully:
+- Closes old connection
+- Resets socket to blocking mode  
+- Loops back to accept new connection
+- Client reconnects with same session ID
 
 ## Architecture
 

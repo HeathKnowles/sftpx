@@ -1,7 +1,8 @@
 // Common utilities and shared code
 
-pub mod error;
+pub mod cert_gen;
 pub mod config;
+pub mod error;
 pub mod types;
 pub mod utils;
 
