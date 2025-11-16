@@ -38,7 +38,7 @@ impl Default for ServerConfig {
             max_idle_timeout: 5000,
             max_data: 2_560_000_000,  // 2.56GB connection window for parallel processing
             max_stream_data: 268_435_456,  // 256MB per stream for parallel processing
-            max_streams: 100,
+            max_streams: 1000,  // Increased for parallel chunk transfers
         }
     }
 }

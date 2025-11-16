@@ -56,8 +56,8 @@ impl ClientConnection {
         quic_config.set_initial_max_stream_data_bidi_local(MAX_STREAM_WINDOW);  // 256MB per stream
         quic_config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_WINDOW);  // 256MB per stream
         quic_config.set_initial_max_stream_data_uni(MAX_STREAM_WINDOW);  // 256MB per stream
-        quic_config.set_initial_max_streams_bidi(100);
-        quic_config.set_initial_max_streams_uni(100);
+        quic_config.set_initial_max_streams_bidi(1000);  // Increased for parallel chunk transfers
+        quic_config.set_initial_max_streams_uni(1000);  // Increased for parallel transfers
         quic_config.set_disable_active_migration(false);
         
         // Balanced performance tuning

@@ -2,7 +2,6 @@
 // Run with: cargo run --example file_server
 
 use sftpx::server::{Server, ServerConfig};
-use std::env;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
