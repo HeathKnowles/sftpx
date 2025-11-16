@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::new(server_addr, server_name)
         .disable_cert_verification()  // Skip cert verification for testing
         .with_chunk_size(262144)?     // 256 KB chunks
-        .with_compression(CompressionType::Lz4);  // Enable LZ4 compression
+        .with_compression(CompressionType::Zstd);  // Enable Zstd compression
     
     println!("Client Configuration:");
     println!("  Server: {}", server_addr);

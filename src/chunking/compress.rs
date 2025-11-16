@@ -1,22 +1,18 @@
-// Chunk compression implementations
+// Chunk compression implementations using Zstd only
 use crate::common::error::{Error, Result};
 
-/// Compression algorithm type
+/// Compression algorithm type - Zstd only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionType {
     None = 0,
-    Lz4 = 1,
-    Lz4Hc = 2,    // High compression variant
-    Zstd = 3,
+    Zstd = 1,
 }
 
 impl CompressionType {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(CompressionType::None),
-            1 => Some(CompressionType::Lz4),
-            2 => Some(CompressionType::Lz4Hc),
-            3 => Some(CompressionType::Zstd),
+            1 => Some(CompressionType::Zstd),
             _ => None,
         }
     }
@@ -49,62 +45,7 @@ impl ChunkCompressor for NoneCompressor {
         CompressionType::None
     }
 }
-
-/// LZ4 fast compression
-pub struct Lz4Compressor;
-
-impl ChunkCompressor for Lz4Compressor {
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        lz4::block::compress(data, None, false)
-            .map_err(|e| Error::Compression(format!("LZ4 compression failed: {}", e)))
-    }
-    
-    fn decompress(&self, data: &[u8], original_size: usize) -> Result<Vec<u8>> {
-        lz4::block::decompress(data, Some(original_size as i32))
-            .map_err(|e| Error::Decompression(format!("LZ4 decompression failed: {}", e)))
-    }
-    
-    fn compression_type(&self) -> CompressionType {
-        CompressionType::Lz4
-    }
-}
-
-/// LZ4-HC (high compression) variant
-pub struct Lz4HcCompressor {
-    compression_level: i32,
-}
-
-impl Lz4HcCompressor {
-    pub fn new(level: i32) -> Self {
-        Self {
-            compression_level: level.clamp(1, 12),
-        }
-    }
-}
-
-impl Default for Lz4HcCompressor {
-    fn default() -> Self {
-        Self::new(9) // Default to level 9
-    }
-}
-
-impl ChunkCompressor for Lz4HcCompressor {
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        lz4::block::compress(data, Some(lz4::block::CompressionMode::HIGHCOMPRESSION(self.compression_level)), false)
-            .map_err(|e| Error::Compression(format!("LZ4-HC compression failed: {}", e)))
-    }
-    
-    fn decompress(&self, data: &[u8], original_size: usize) -> Result<Vec<u8>> {
-        lz4::block::decompress(data, Some(original_size as i32))
-            .map_err(|e| Error::Decompression(format!("LZ4-HC decompression failed: {}", e)))
-    }
-    
-    fn compression_type(&self) -> CompressionType {
-        CompressionType::Lz4Hc
-    }
-}
-
-/// Zstd compression
+/// Zstd compression - fast and efficient
 pub struct ZstdCompressor {
     compression_level: i32,
 }
@@ -119,7 +60,7 @@ impl ZstdCompressor {
 
 impl Default for ZstdCompressor {
     fn default() -> Self {
-        Self::new(3) // Default to level 3 (fast)
+        Self::new(3) // Default to level 3 (balanced speed/compression)
     }
 }
 
@@ -143,8 +84,6 @@ impl ChunkCompressor for ZstdCompressor {
 pub fn create_compressor(compression_type: CompressionType) -> Box<dyn ChunkCompressor> {
     match compression_type {
         CompressionType::None => Box::new(NoneCompressor),
-        CompressionType::Lz4 => Box::new(Lz4Compressor),
-        CompressionType::Lz4Hc => Box::new(Lz4HcCompressor::default()),
         CompressionType::Zstd => Box::new(ZstdCompressor::default()),
     }
 }
@@ -178,30 +117,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lz4_compression() {
-        let data = b"Hello, World! ".repeat(100);
-        let compressor = Lz4Compressor;
-        
-        let compressed = compressor.compress(&data).unwrap();
-        assert!(compressed.len() < data.len());
-        
-        let decompressed = compressor.decompress(&compressed, data.len()).unwrap();
-        assert_eq!(decompressed, data);
-    }
-
-    #[test]
-    fn test_lz4hc_compression() {
-        let data = b"Hello, World! ".repeat(100);
-        let compressor = Lz4HcCompressor::default();
-        
-        let compressed = compressor.compress(&data).unwrap();
-        assert!(compressed.len() < data.len());
-        
-        let decompressed = compressor.decompress(&compressed, data.len()).unwrap();
-        assert_eq!(decompressed, data);
-    }
-
-    #[test]
     fn test_zstd_compression() {
         let data = b"Hello, World! ".repeat(100);
         let compressor = ZstdCompressor::default();
@@ -214,14 +129,35 @@ mod tests {
     }
 
     #[test]
+    fn test_zstd_levels() {
+        let data = b"Hello, World! ".repeat(100);
+        
+        // Test different compression levels
+        let compressor_fast = ZstdCompressor::new(1);
+        let compressor_balanced = ZstdCompressor::new(3);
+        let compressor_high = ZstdCompressor::new(10);
+        
+        let compressed_fast = compressor_fast.compress(&data).unwrap();
+        let compressed_balanced = compressor_balanced.compress(&data).unwrap();
+        let compressed_high = compressor_high.compress(&data).unwrap();
+        
+        // Higher levels should compress better
+        assert!(compressed_high.len() <= compressed_balanced.len());
+        assert!(compressed_balanced.len() <= compressed_fast.len());
+        
+        // All should decompress correctly
+        assert_eq!(compressor_fast.decompress(&compressed_fast, data.len()).unwrap(), data);
+        assert_eq!(compressor_balanced.decompress(&compressed_balanced, data.len()).unwrap(), data);
+        assert_eq!(compressor_high.decompress(&compressed_high, data.len()).unwrap(), data);
+    }
+
+    #[test]
     fn test_compression_type_conversion() {
         assert_eq!(CompressionType::from_u8(0), Some(CompressionType::None));
-        assert_eq!(CompressionType::from_u8(1), Some(CompressionType::Lz4));
-        assert_eq!(CompressionType::from_u8(2), Some(CompressionType::Lz4Hc));
-        assert_eq!(CompressionType::from_u8(3), Some(CompressionType::Zstd));
+        assert_eq!(CompressionType::from_u8(1), Some(CompressionType::Zstd));
         assert_eq!(CompressionType::from_u8(99), None);
         
         assert_eq!(CompressionType::None.as_u8(), 0);
-        assert_eq!(CompressionType::Lz4.as_u8(), 1);
+        assert_eq!(CompressionType::Zstd.as_u8(), 1);
     }
 }
