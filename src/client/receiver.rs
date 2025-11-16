@@ -25,7 +25,7 @@ pub enum SyncMode {
 
 impl Default for SyncMode {
     fn default() -> Self {
-        SyncMode::BufferedInMemory  // Changed to in-memory buffering by default
+        SyncMode::FlushOnly  // Changed back to FlushOnly - no in-memory buffering
     }
 }
 
