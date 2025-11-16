@@ -58,7 +58,7 @@ impl ClientConnection {
         quic_config.set_initial_max_stream_data_uni(1_000_000_000);  // 1GB per stream
         quic_config.set_initial_max_streams_bidi(1000);
         quic_config.set_initial_max_streams_uni(1000);
-        quic_config.set_disable_active_migration(false);
+        quic_config.set_disable_active_migration(true);  // Disable migration to avoid conflicts on resume
         
         // Use CUBIC with reasonable initial window
         quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);

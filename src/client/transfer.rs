@@ -338,6 +338,14 @@ impl Transfer {
     pub fn run_send(&mut self, file_path: &Path) -> Result<u64> {
         info!("Starting integrated file send transfer");
         
+        // Check if we have resume bitmaps (indicates this might be a resume)
+        // Give server a moment to cleanup any old connection
+        let resume_dir = std::path::PathBuf::from("sftpx_resume");
+        if resume_dir.exists() && resume_dir.read_dir().ok().map(|mut d| d.next().is_some()).unwrap_or(false) {
+            info!("Client: detected potential resume, waiting 200ms for server cleanup...");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        
         // Bind UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.connect(self.config.server_addr)?;
@@ -422,15 +430,37 @@ impl Transfer {
     ) -> Result<()> {
         info!("Client: waiting for handshake to complete...");
         
+        let start_time = std::time::Instant::now();
+        let handshake_timeout = Duration::from_secs(10); // 10 second timeout for handshake
+        let mut iterations = 0;
+        
         loop {
+            iterations += 1;
+            
+            // Check timeout
+            if start_time.elapsed() > handshake_timeout {
+                return Err(Error::Protocol(format!(
+                    "Handshake timeout after {} seconds (iterations: {})",
+                    handshake_timeout.as_secs(),
+                    iterations
+                )));
+            }
+            
             socket.set_read_timeout(Some(Duration::from_millis(100)))?;
             match socket.recv_from(buf) {
                 Ok((len, from)) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = connection.recv(&mut buf[..len], recv_info);
+                    if iterations % 10 == 0 {
+                        info!("Client: received packet during handshake (iteration {})", iterations);
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock ||
-                          e.kind() == std::io::ErrorKind::TimedOut => {}
+                          e.kind() == std::io::ErrorKind::TimedOut => {
+                    if iterations % 50 == 0 {
+                        info!("Client: waiting for handshake... ({:.1}s elapsed)", start_time.elapsed().as_secs_f64());
+                    }
+                }
                 Err(e) => return Err(Error::from(e)),
             }
             
@@ -439,7 +469,8 @@ impl Transfer {
             }
             
             if connection.is_established() && connection.peer_streams_left_bidi() > 0 {
-                info!("Client: handshake complete!");
+                info!("Client: handshake complete! (took {:.2}s, {} iterations)", 
+                    start_time.elapsed().as_secs_f64(), iterations);
                 self.state = TransferState::Handshaking;
                 break;
             }
@@ -845,7 +876,7 @@ impl Transfer {
         let mut received_response = false;
         let mut skip_chunks = HashSet::new();
         let mut idle_iterations = 0;
-        const MAX_IDLE: usize = 200; // 200 * 10ms = 2 seconds
+        const MAX_IDLE: usize = 50; // 50 * 10ms = 500ms timeout (reduced from 2s)
         
         while !received_response && idle_iterations < MAX_IDLE {
             // Flush outgoing packets
@@ -860,6 +891,8 @@ impl Transfer {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = connection.recv(&mut buf[..len], recv_info);
                     idle_iterations = 0;
+                    
+                    info!("Client: received packet during resume wait (iteration {})", idle_iterations);
                     
                     // Check for resume response on STREAM_RESUME
                     while let Ok((read, fin)) = connection.stream_recv(STREAM_RESUME, buf) {
@@ -893,6 +926,9 @@ impl Transfer {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock ||
                               e.kind() == std::io::ErrorKind::TimedOut => {
                     idle_iterations += 1;
+                    if idle_iterations % 10 == 0 {
+                        info!("Client: waiting for resume response... ({}/{})", idle_iterations, MAX_IDLE);
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => return Err(Error::from(e)),
@@ -905,7 +941,8 @@ impl Transfer {
         }
         
         if !received_response {
-            warn!("Client: no resume response received, starting fresh");
+            warn!("Client: no resume response received after 500ms, starting fresh transfer");
+            warn!("Client: (server may not support resume or is not responding)");
             return Ok(HashSet::new());
         }
         
