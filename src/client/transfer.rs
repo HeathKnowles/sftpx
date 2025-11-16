@@ -902,24 +902,26 @@ impl Transfer {
         Ok(skip_chunks)
     }
     
-    /// Save bitmap for resume capability (in-memory)
+    /// Save bitmap for resume capability (in-memory) - optimized to reuse existing bitmap
     fn save_resume_bitmap(&mut self, session_id: &str, bitmap: &ChunkBitmap) -> Result<()> {
-        // Get bitmap properties
         let total_chunks = bitmap.total_chunks().unwrap_or(0);
-        let received_count = bitmap.received_count();
-        let have_eof = bitmap.is_complete();
         
-        // Create new bitmap and copy received chunks
-        let mut new_bitmap = ChunkBitmap::with_exact_size(total_chunks);
-        for i in 0..total_chunks {
-            if bitmap.is_received(i) {
-                new_bitmap.mark_received(i, have_eof && i == total_chunks - 1);
+        // Get or create the bitmap in the HashMap
+        let stored_bitmap = self.resume_bitmaps
+            .entry(session_id.to_string())
+            .or_insert_with(|| ChunkBitmap::with_exact_size(total_chunks));
+        
+        // Only copy the new received chunks (last chunk since last save)
+        // Since we save every 100 chunks, we only need to update the last few
+        let received_count = bitmap.received_count();
+        for i in (received_count.saturating_sub(100))..total_chunks {
+            if bitmap.is_received(i) && !stored_bitmap.is_received(i) {
+                stored_bitmap.mark_received(i, bitmap.is_complete() && i == total_chunks - 1);
             }
         }
         
-        self.resume_bitmaps.insert(session_id.to_string(), new_bitmap);
-        debug!("Client: saved resume bitmap to memory for session {} ({}/{} chunks)", 
-            session_id, received_count, total_chunks);
+        debug!("Client: updated resume bitmap in memory for session {} ({}/{} chunks)", 
+            session_id, bitmap.received_count(), total_chunks);
         Ok(())
     }
     
@@ -1110,6 +1112,9 @@ impl Transfer {
         
         info!("Client: starting file chunk upload...");
         
+        // Set socket to non-blocking mode for maximum performance
+        socket.set_nonblocking(true)?;
+        
         // Convert existing hashes to HashSet for efficient lookup
         let existing_set: HashSet<&[u8]> = existing_hashes.iter()
             .map(|v| v.as_slice())
@@ -1192,14 +1197,14 @@ impl Transfer {
             let is_eof_chunk = chunk_count == total_chunks;
             sent_bitmap.mark_received((chunk_count - 1) as u32, is_eof_chunk);
             
-            // Periodically save bitmap for resume
-            if chunk_count % 10 == 0 || is_eof_chunk {
+            // Periodically save bitmap for resume (every 100 chunks)
+            if chunk_count % 100 == 0 || is_eof_chunk {
                 if let Err(e) = self.save_resume_bitmap(&manifest.session_id, &sent_bitmap) {
                     warn!("Client: failed to save resume bitmap: {}", e);
                 }
             }
             
-            if chunk_count % 5 == 0 || is_last {
+            if chunk_count % 50 == 0 || is_last {
                 info!("Client: sent chunk {}/{} ({:.1}%)", 
                     chunk_count, total_chunks, (chunk_count as f64 / total_chunks as f64) * 100.0);
             }
@@ -1276,7 +1281,7 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_iterations = 50000;  // More iterations, but faster loop
+        let max_iterations = 100000;  // Higher limit for truly non-blocking operation
         let mut iterations = 0;
         
         while written < data.len() {
