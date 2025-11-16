@@ -52,20 +52,23 @@ impl ClientConnection {
         quic_config.set_max_idle_timeout(IDLE_TIMEOUT.as_millis() as u64);
         quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        quic_config.set_initial_max_data(MAX_STREAM_WINDOW * 10);  // 2.56GB connection window
-        quic_config.set_initial_max_stream_data_bidi_local(MAX_STREAM_WINDOW);  // 256MB per stream
-        quic_config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_WINDOW);  // 256MB per stream
-        quic_config.set_initial_max_stream_data_uni(MAX_STREAM_WINDOW);  // 256MB per stream
+        quic_config.set_initial_max_data(MAX_STREAM_WINDOW * 100);  // 25.6GB connection window - massive!
+        quic_config.set_initial_max_stream_data_bidi_local(MAX_STREAM_WINDOW * 10);  // 2.56GB per stream
+        quic_config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_WINDOW * 10);  // 2.56GB per stream
+        quic_config.set_initial_max_stream_data_uni(MAX_STREAM_WINDOW * 10);  // 2.56GB per stream
         quic_config.set_initial_max_streams_bidi(1000);  // Increased for parallel chunk transfers
         quic_config.set_initial_max_streams_uni(1000);  // Increased for parallel transfers
         quic_config.set_disable_active_migration(false);
         
-        // Disable congestion control for maximum throughput on reliable networks
+        // Use Reno with massive initial window - effectively disables slow start
         quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::Reno);
         quic_config.enable_hystart(true);  // Faster ramp-up
         
-        // Large initial congestion window for immediate high throughput
-        quic_config.set_initial_congestion_window_packets(100);
+        // Huge initial congestion window - send as fast as possible from the start
+        quic_config.set_initial_congestion_window_packets(1000);  // 10x larger than before!
+        
+        // Disable pacing to send packets as fast as possible
+        quic_config.enable_pacing(false);
         
         // TLS verification
         if !config.verify_cert {

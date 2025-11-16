@@ -1334,25 +1334,18 @@ impl Transfer {
         // Set socket to non-blocking for efficient I/O
         socket.set_nonblocking(true).ok();
         
-        let mut stall_count = 0;
-        
         while written < data.len() {
-            let before_written = written;
-            
-            // Try to write to stream - keep trying until we can't write more
-            loop {
-                match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
-                    Ok(w) if w > 0 => {
-                        written += w;
-                        stall_count = 0;
-                    }
-                    Ok(_) => break,
-                    Err(ref e) if format!("{:?}", e).contains("Done") => break,
-                    Err(e) => return Err(e),
+            // Try to write as much as possible to the stream
+            match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
+                Ok(w) if w > 0 => {
+                    written += w;
                 }
+                Ok(_) => {}
+                Err(ref e) if format!("{:?}", e).contains("Done") => {}
+                Err(e) => return Err(e),
             }
             
-            // Flush packets - send all available aggressively
+            // Flush all pending packets aggressively
             loop {
                 match connection.send(out) {
                     Ok((len, send_info)) => {
@@ -1366,27 +1359,21 @@ impl Transfer {
                 }
             }
             
-            // Receive ACKs - drain all available packets aggressively
+            // Receive ACKs - drain all available
             loop {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
                         let _ = connection.recv(&mut buf[..len], recv_info);
-                        stall_count = 0;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
             }
             
-            // Only sleep if we're completely stalled for multiple iterations
-            if written == before_written {
-                stall_count += 1;
-                if stall_count > 100 {
-                    // Genuinely stalled - tiny sleep
-                    std::thread::sleep(Duration::from_micros(10));
-                    stall_count = 0;
-                }
+            // If we've written everything, we're done - don't wait around!
+            if written >= data.len() {
+                break;
             }
             
             // Timeout check
