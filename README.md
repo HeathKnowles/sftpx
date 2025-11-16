@@ -1,13 +1,12 @@
-# SFTPX - QUIC-Based File Transfer with Auto-Resume
+# SFTPX - QUIC-Based File Transfer
 
-A high-performance file transfer system built with QUIC protocol using the `quiche` crate, featuring integrated orchestration, automatic resume capability, and BLAKE3 integrity verification.
+A high-performance file transfer system built with QUIC protocol using the `quiche` crate, featuring integrated orchestration, and BLAKE3 integrity verification.
 
 ## Features
 
 ✅ **Core Features:**
 - QUIC-based transport with CUBIC congestion control
 - Integrated file transfer orchestration (handshake → manifest → chunks)
-- Automatic resume capability with persistent bitmaps
 - BLAKE3 integrity verification per chunk
 - 4 QUIC streams (Control, Manifest, Data, Status)
 - CLI tool with send/recv commands
@@ -50,8 +49,6 @@ sftpx send myfile.dat
 # Send to remote server
 sftpx send myfile.dat 192.168.1.100
 
-# Interrupt with Ctrl+C and resume automatically
-sftpx send myfile.dat  # Resume detected automatically
 ```
 
 ## CLI Commands
@@ -72,7 +69,6 @@ sftpx init --ip 192.168.1.100
 ```
 
 ### `sftpx send`
-Send a file to a remote server with auto-resume.
 
 ```bash
 sftpx send <file> [server]
@@ -83,9 +79,8 @@ sftpx send <file> [server]
 - `[server]` - Server IP address (default: 127.0.0.1)
 
 **Features:**
-- Automatically detects interrupted transfers and resumes
+- Automatically detects interrupted transfers
 - Session ID based on file path (deterministic)
-- Resume bitmaps saved every 100 chunks in `sftpx_resume/`
 - Progress reporting during transfer
 
 **Example:**
@@ -110,14 +105,6 @@ sftpx recv --bind 192.168.1.100:4443 --upload-dir /var/uploads
 ```
 
 ## Features in Detail
-
-### Auto-Resume Capability
-
-Transfer state is persisted to disk every 100 chunks:
-- Session ID: BLAKE3 hash of file path (deterministic)
-- Bitmap storage: `sftpx_resume/<session_id>.bitmap`
-- Automatic detection: Client checks for existing bitmaps on startup
-- Server cleanup: 200ms delay allows server to reset before reconnection
 
 ### BLAKE3 Integrity
 
