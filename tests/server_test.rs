@@ -57,9 +57,9 @@ fn test_server_config_defaults() {
     assert_eq!(config.cert_path, "certs/cert.pem");
     assert_eq!(config.key_path, "certs/key.pem");
     assert_eq!(config.max_idle_timeout, 5000);
-    assert_eq!(config.max_data, 10_000_000);
-    assert_eq!(config.max_stream_data, 1_000_000);
-    assert_eq!(config.max_streams, 100);
+    assert_eq!(config.max_data, 2_560_000_000);  // 2.56GB connection window
+    assert_eq!(config.max_stream_data, 268_435_456);  // 256MB per stream
+    assert_eq!(config.max_streams, 1000);  // Increased for parallel transfers
 }
 
 #[test]
@@ -74,9 +74,9 @@ fn test_stream_manager() {
     assert_eq!(StreamType::Data.stream_id(), 8);
     assert_eq!(StreamType::Status.stream_id(), 12);
     
-    // Test all streams
+    // Test all streams (now includes HashCheck, Resume, Delta)
     let all_streams = StreamType::all();
-    assert_eq!(all_streams.len(), 4);
+    assert_eq!(all_streams.len(), 7);
     
     // Test initial state
     assert_eq!(manager.stream_count(), 0);
