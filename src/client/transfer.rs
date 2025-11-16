@@ -1180,6 +1180,10 @@ impl Transfer {
         // Process chunks in parallel pipeline
         let mut chunk_iter = chunker.process_chunks()?;
         
+        // Pipeline: Queue up to N chunks at once for better throughput
+        let mut pending_chunks: Vec<Vec<u8>> = Vec::new();
+        let max_pending = 10; // Keep up to 10 chunks in pipeline
+        
         while let Some(chunk_result) = chunk_iter.next() {
             let processed_chunk = chunk_result?;
             let chunk_id = processed_chunk.chunk_id;
@@ -1209,16 +1213,14 @@ impl Transfer {
                 continue;
             }
             
-            // Combine length prefix and chunk data into single send
+            // Combine length prefix and chunk data into single buffer
             let len_bytes = (processed_chunk.packet.len() as u32).to_be_bytes();
             let mut combined_data = Vec::with_capacity(4 + processed_chunk.packet.len());
             combined_data.extend_from_slice(&len_bytes);
             combined_data.extend_from_slice(&processed_chunk.packet);
             
-            self.send_data_with_flow_control(
-                connection, socket, buf, out, local_addr,
-                STREAM_DATA, &combined_data, is_last
-            )?;
+            // Add to pipeline
+            pending_chunks.push(combined_data);
             
             bytes_sent += processed_chunk.packet.len() as u64;
             chunk_count += 1;
@@ -1226,6 +1228,14 @@ impl Transfer {
             // Mark chunk as sent in bitmap for resume capability
             let is_eof_chunk = chunk_count == total_chunks;
             sent_bitmap.mark_received((chunk_count - 1) as u32, is_eof_chunk);
+            
+            // Flush pipeline when it's full or this is the last chunk
+            if pending_chunks.len() >= max_pending || is_last {
+                self.send_pipelined_chunks(
+                    connection, socket, buf, out, local_addr,
+                    STREAM_DATA, &mut pending_chunks, is_last
+                )?;
+            }
             
             // Periodically save bitmap for resume (every 100 chunks)
             if chunk_count % 100 == 0 || is_eof_chunk {
@@ -1313,6 +1323,97 @@ impl Transfer {
         }
         
         Ok(bytes_sent)
+    }
+    
+    /// Helper: Send multiple chunks in a pipeline for better throughput
+    fn send_pipelined_chunks(
+        &self,
+        connection: &mut ClientConnection,
+        socket: &UdpSocket,
+        buf: &mut [u8],
+        out: &mut [u8],
+        local_addr: std::net::SocketAddr,
+        stream_id: u64,
+        chunks: &mut Vec<Vec<u8>>,
+        fin: bool,
+    ) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        
+        socket.set_nonblocking(true).ok();
+        
+        let mut chunk_index = 0;
+        let mut chunk_offset = 0;
+        let start_time = std::time::Instant::now();
+        let max_duration = Duration::from_secs(300);
+        
+        let mut no_progress_count = 0;
+        
+        while chunk_index < chunks.len() {
+            let prev_chunk_index = chunk_index;
+            let prev_offset = chunk_offset;
+            
+            // Try to write current chunk
+            let current_chunk = &chunks[chunk_index];
+            let is_final = fin && chunk_index == chunks.len() - 1 && chunk_offset + 1 >= current_chunk.len();
+            
+            match connection.stream_send(stream_id, &current_chunk[chunk_offset..], is_final) {
+                Ok(w) if w > 0 => {
+                    chunk_offset += w;
+                    no_progress_count = 0;
+                    
+                    // Move to next chunk if current is complete
+                    if chunk_offset >= current_chunk.len() {
+                        chunk_index += 1;
+                        chunk_offset = 0;
+                    }
+                }
+                Ok(_) => {}
+                Err(ref e) if format!("{:?}", e).contains("Done") => {}
+                Err(e) => return Err(e),
+            }
+            
+            // Flush packets
+            while let Ok((len, send_info)) = connection.send(out) {
+                match socket.send_to(&out[..len], send_info.to) {
+                    Ok(_) => { no_progress_count = 0; },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(Error::from(e)),
+                }
+            }
+            
+            // Receive ACKs
+            for _ in 0..5 {
+                match socket.recv_from(buf) {
+                    Ok((len, from)) => {
+                        let recv_info = quiche::RecvInfo { from, to: local_addr };
+                        let _ = connection.recv(&mut buf[..len], recv_info);
+                        no_progress_count = 0;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            
+            // Backoff if stalled
+            if chunk_index == prev_chunk_index && chunk_offset == prev_offset {
+                no_progress_count += 1;
+                if no_progress_count > 50 {
+                    std::thread::sleep(Duration::from_micros(100));
+                    no_progress_count = 0;
+                } else if no_progress_count > 10 {
+                    std::thread::yield_now();
+                }
+            }
+            
+            if start_time.elapsed() > max_duration {
+                return Err(Error::Protocol("Pipelined send timeout".to_string()));
+            }
+        }
+        
+        chunks.clear();
+        Ok(())
     }
     
     /// Helper: Send data with flow control handling
