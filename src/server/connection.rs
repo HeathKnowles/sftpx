@@ -42,12 +42,15 @@ impl ServerConnection {
         from: SocketAddr,
         to: SocketAddr,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        // Detect peer address migration - this means client restarted
+        // Detect peer address migration - this usually means client restarted
+        // In this case, we should close this connection and let server accept new one
         if from != self.peer_addr && self.conn.is_established() {
             println!("Server: Peer migrated from {} to {} - treating as new connection", self.peer_addr, from);
-            self.peer_addr = from;
-            self.migration_count += 1;
+            println!("Server: Closing old connection to allow new handshake");
             self.migration_detected = true;
+            // Close the connection immediately
+            let _ = self.conn.close(true, 0x00, b"peer migration");
+            return Err("Peer migration - connection closed".into());
         }
         
         let recv_info = RecvInfo { from, to };

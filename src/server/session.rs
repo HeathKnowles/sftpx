@@ -77,6 +77,13 @@ impl<'a> ServerSession<'a> {
                     println!("Server: handshake recv {} bytes", len);
                     let to = socket.local_addr()?;
                     self.connection.process_packet(&mut buf[..len], from, to)?;
+                    
+                    // Check if migration was detected during handshake - abort immediately
+                    if self.connection.migration_detected() {
+                        println!("Server: migration detected during handshake - aborting to accept new connection");
+                        return Err("Peer migration during handshake".into());
+                    }
+                    
                     self.connection.send_packets(socket, out)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
