@@ -48,7 +48,7 @@ impl ClientConnection {
             .set_application_protos(&[PROTOCOL_VERSION.as_bytes()])
             .map_err(|e| Error::Quic(format!("Failed to set application protos: {:?}", e)))?;
         
-        // Configure transport parameters for high-speed parallel transfers
+        // Configure transport parameters for maximum throughput
         quic_config.set_max_idle_timeout(IDLE_TIMEOUT.as_millis() as u64);
         quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -59,6 +59,15 @@ impl ClientConnection {
         quic_config.set_initial_max_streams_bidi(100);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(false);
+        
+        // Performance tuning: use CUBIC congestion control for better throughput
+        quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
+        
+        // Enable early data for 0-RTT
+        quic_config.enable_early_data();
+        
+        // Disable pacing for maximum burst performance (use with caution)
+        quic_config.enable_pacing(false);
         
         // TLS verification
         if !config.verify_cert {
