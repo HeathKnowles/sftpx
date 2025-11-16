@@ -41,6 +41,9 @@ rayon = "1.10"
 crossbeam-channel = "0.5"
 num_cpus = "1.16"
 
+# Event-driven I/O
+mio = { version = "1.0", features = ["os-poll", "net"] }
+
 # Utilities
 hex = "0.4"
 

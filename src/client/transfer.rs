@@ -4,6 +4,8 @@ use std::net::UdpSocket;
 use std::time::Duration;
 use std::path::{Path, PathBuf};
 use log::{info, debug, error, warn};
+use mio::{Events, Interest, Poll, Token};
+use mio::net::UdpSocket as MioUdpSocket;
 use crate::common::error::{Error, Result};
 use crate::common::config::ClientConfig;
 use crate::common::types::*;
@@ -1315,7 +1317,8 @@ impl Transfer {
         Ok(bytes_sent)
     }
     
-    /// Helper: Send data with flow control handling
+    /// Helper: Send data with flow control handling using event-driven I/O
+    /// QUIC event loop: recv all → stream_send once → send all → poll → repeat
     fn send_data_with_flow_control(
         &self,
         connection: &mut ClientConnection,
@@ -1327,90 +1330,72 @@ impl Transfer {
         data: &[u8],
         fin: bool,
     ) -> Result<()> {
+        // Convert std UdpSocket to mio UdpSocket for event-driven I/O
+        socket.set_nonblocking(true)?;
+        let mut mio_socket = MioUdpSocket::from_std(socket.try_clone()?);
+        
+        // Create poll instance for OS-level event notification
+        let mut poll = Poll::new().map_err(|e| Error::Io(e))?;
+        let mut events = Events::with_capacity(128);
+        const SOCKET: Token = Token(0);
+        
+        poll.registry()
+            .register(&mut mio_socket, SOCKET, Interest::READABLE | Interest::WRITABLE)
+            .map_err(|e| Error::Io(e))?;
+        
         let mut written = 0;
-        let max_iterations = 10_000_000;  // 10 million iterations - very high limit
-        let mut iterations = 0;
-        let mut consecutive_no_progress = 0;
-        let start_time = std::time::Instant::now();
-        let max_duration = Duration::from_secs(300);  // 5 minutes timeout
         
         while written < data.len() {
-            let before_written = written;
-            
-            // Try to write to stream
-            match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
-                Ok(w) if w > 0 => {
-                    written += w;
-                    consecutive_no_progress = 0;
-                }
-                Ok(_) => {}
-                Err(ref e) if format!("{:?}", e).contains("Done") => {}
-                Err(e) => return Err(e),
-            }
-            
-            // Flush packets
-            let mut sent_packet = false;
-            while let Ok((len, send_info)) = connection.send(out) {
-                match socket.send_to(&out[..len], send_info.to) {
-                    Ok(_) => { sent_packet = true; },
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(Error::from(e)),
-                }
-            }
-            
-            // Receive ACKs - read multiple packets per iteration
-            let mut received_ack = false;
-            for _ in 0..10 {
+            // Step 1: Receive ALL packets until WouldBlock
+            loop {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
-                        let _ = connection.recv(&mut buf[..len], recv_info);
-                        received_ack = true;
+                        connection.recv(&mut buf[..len], recv_info)?;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
                     Err(e) => return Err(Error::from(e)),
                 }
             }
             
-            // Progress tracking - only sleep after many iterations with zero activity
-            if written == before_written {
-                consecutive_no_progress += 1;
-                
-                // Only yield after significant stall with zero network activity
-                if consecutive_no_progress > 5000 && !sent_packet && !received_ack {
-                    std::thread::sleep(Duration::from_micros(1));
-                    consecutive_no_progress = 0;
-                } else if sent_packet || received_ack {
-                    consecutive_no_progress = 0;
+            // Step 2: Push data into stream (ONE attempt only)
+            match connection.stream_send(stream_id, &data[written..], fin && written >= data.len()) {
+                Ok(w) => written += w,
+                Err(e) if e.to_string().contains("Done") => {
+                    // Stream not writable, continue to send/poll
+                }
+                Err(e) => return Err(e),
+            }
+            
+            // Step 3: Send ALL quiche packets until Done/WouldBlock
+            loop {
+                match connection.send(out) {
+                    Ok((len, send_info)) => {
+                        match socket.send_to(&out[..len], send_info.to) {
+                            Ok(_) => {}
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => return Err(Error::from(e)),
+                        }
+                    }
+                    Err(e) if e.to_string().contains("Done") => break,
+                    Err(e) => return Err(e),
                 }
             }
             
-            iterations += 1;
-            
-            // Log progress every 1 million iterations
-            if iterations % 1_000_000 == 0 {
-                debug!("Flow control: {} iterations, {}/{} bytes ({:.1}%), {:.1}s elapsed",
-                    iterations, written, data.len(), 
-                    (written as f64 / data.len() as f64) * 100.0,
-                    start_time.elapsed().as_secs_f64());
+            if written >= data.len() {
+                break;
             }
             
-            if start_time.elapsed() > max_duration {
-                return Err(Error::Protocol(format!(
-                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {:.1}s",
-                    written, data.len(), (written as f64 / data.len() as f64) * 100.0,
-                    start_time.elapsed().as_secs_f64()
-                )));
+            // Step 4: poll() for readable/writable or timeout - LET THE OS CONTROL THE LOOP
+            let timeout = connection.timeout();
+            poll.poll(&mut events, timeout).map_err(|e| Error::Io(e))?;
+            
+            // Step 5: If timeout expired, notify quiche
+            if events.is_empty() {
+                connection.on_timeout();
             }
             
-            if iterations >= max_iterations {
-                return Err(Error::Protocol(format!(
-                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} iterations ({:.1}s)",
-                    written, data.len(), (written as f64 / data.len() as f64) * 100.0, 
-                    max_iterations, start_time.elapsed().as_secs_f64()
-                )));
-            }
+            // Step 6: Repeat (loop continues)
         }
         
         Ok(())
