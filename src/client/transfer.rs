@@ -1328,87 +1328,68 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_iterations = 10_000_000;  // 10 million iterations - very high limit
-        let mut iterations = 0;
-        let mut consecutive_no_progress = 0;
         let start_time = std::time::Instant::now();
         let max_duration = Duration::from_secs(300);  // 5 minutes timeout
         
+        // Set socket to non-blocking for efficient I/O
+        socket.set_nonblocking(true).ok();
+        socket.set_read_timeout(Some(Duration::from_millis(1))).ok();
+        
         while written < data.len() {
-            let before_written = written;
+            let loop_start = std::time::Instant::now();
             
             // Try to write to stream
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
                 Ok(w) if w > 0 => {
                     written += w;
-                    consecutive_no_progress = 0;
                 }
                 Ok(_) => {}
                 Err(ref e) if format!("{:?}", e).contains("Done") => {}
                 Err(e) => return Err(e),
             }
             
-            // Flush packets
-            let mut sent_packet = false;
+            // Flush packets - send all available
+            let mut packets_sent = 0;
             while let Ok((len, send_info)) = connection.send(out) {
                 match socket.send_to(&out[..len], send_info.to) {
-                    Ok(_) => { sent_packet = true; },
+                    Ok(_) => { packets_sent += 1; },
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(Error::from(e)),
                 }
             }
             
-            // Receive ACKs - read multiple packets per iteration
-            let mut received_ack = false;
-            for _ in 0..10 {
+            // Receive ACKs - process up to 3 packets per iteration (balanced approach)
+            let mut acks_received = 0;
+            for _ in 0..3 {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
                         let _ = connection.recv(&mut buf[..len], recv_info);
-                        received_ack = true;
+                        acks_received += 1;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-                    Err(e) => return Err(Error::from(e)),
+                    Err(_) => break,
                 }
             }
             
-            // Progress tracking - only sleep after many iterations with zero activity
-            if written == before_written {
-                consecutive_no_progress += 1;
-                
-                // Only yield after significant stall with zero network activity
-                if consecutive_no_progress > 5000 && !sent_packet && !received_ack {
-                    std::thread::sleep(Duration::from_micros(1));
-                    consecutive_no_progress = 0;
-                } else if sent_packet || received_ack {
-                    consecutive_no_progress = 0;
-                }
+            // Allow congestion control to work by giving it time between iterations
+            // Sleep only if we're stalled (no progress) to let ACKs arrive
+            let loop_duration = loop_start.elapsed();
+            if packets_sent == 0 && acks_received == 0 {
+                // No activity - wait a bit for ACKs to arrive
+                std::thread::sleep(Duration::from_micros(100));
+            } else if loop_duration < Duration::from_micros(50) {
+                // Loop ran too fast - pace ourselves to avoid CPU thrashing
+                std::thread::yield_now();
             }
             
-            iterations += 1;
-            
-            // Log progress every 1 million iterations
-            if iterations % 1_000_000 == 0 {
-                debug!("Flow control: {} iterations, {}/{} bytes ({:.1}%), {:.1}s elapsed",
-                    iterations, written, data.len(), 
-                    (written as f64 / data.len() as f64) * 100.0,
-                    start_time.elapsed().as_secs_f64());
-            }
-            
+            // Timeout check
             if start_time.elapsed() > max_duration {
                 return Err(Error::Protocol(format!(
                     "Flow control timeout: sent {}/{} bytes ({:.1}%) after {:.1}s",
                     written, data.len(), (written as f64 / data.len() as f64) * 100.0,
                     start_time.elapsed().as_secs_f64()
-                )));
-            }
-            
-            if iterations >= max_iterations {
-                return Err(Error::Protocol(format!(
-                    "Flow control timeout: sent {}/{} bytes ({:.1}%) after {} iterations ({:.1}s)",
-                    written, data.len(), (written as f64 / data.len() as f64) * 100.0, 
-                    max_iterations, start_time.elapsed().as_secs_f64()
                 )));
             }
         }

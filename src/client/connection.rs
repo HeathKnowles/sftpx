@@ -60,9 +60,12 @@ impl ClientConnection {
         quic_config.set_initial_max_streams_uni(1000);  // Increased for parallel transfers
         quic_config.set_disable_active_migration(false);
         
-        // Balanced performance tuning
-        quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
+        // Use BBR for better throughput on high-bandwidth networks
+        quic_config.set_cc_algorithm(quiche::CongestionControlAlgorithm::BBR);
         quic_config.enable_hystart(true);  // Faster ramp-up
+        
+        // Increase initial congestion window for faster start
+        quic_config.set_initial_congestion_window_packets(10);
         
         // TLS verification
         if !config.verify_cert {
