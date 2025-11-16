@@ -1333,11 +1333,8 @@ impl Transfer {
         
         // Set socket to non-blocking for efficient I/O
         socket.set_nonblocking(true).ok();
-        socket.set_read_timeout(Some(Duration::from_millis(1))).ok();
         
         while written < data.len() {
-            let loop_start = std::time::Instant::now();
-            
             // Try to write to stream
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
                 Ok(w) if w > 0 => {
@@ -1350,17 +1347,22 @@ impl Transfer {
             
             // Flush packets - send all available
             let mut packets_sent = 0;
-            while let Ok((len, send_info)) = connection.send(out) {
-                match socket.send_to(&out[..len], send_info.to) {
-                    Ok(_) => { packets_sent += 1; },
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(Error::from(e)),
+            loop {
+                match connection.send(out) {
+                    Ok((len, send_info)) => {
+                        match socket.send_to(&out[..len], send_info.to) {
+                            Ok(_) => { packets_sent += 1; },
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => return Err(Error::from(e)),
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
             
-            // Receive ACKs - process up to 3 packets per iteration (balanced approach)
+            // Receive ACKs - drain all available packets
             let mut acks_received = 0;
-            for _ in 0..3 {
+            loop {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
@@ -1368,20 +1370,20 @@ impl Transfer {
                         acks_received += 1;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
                     Err(_) => break,
                 }
             }
             
-            // Allow congestion control to work by giving it time between iterations
-            // Sleep only if we're stalled (no progress) to let ACKs arrive
-            let loop_duration = loop_start.elapsed();
-            if packets_sent == 0 && acks_received == 0 {
-                // No activity - wait a bit for ACKs to arrive
-                std::thread::sleep(Duration::from_micros(100));
-            } else if loop_duration < Duration::from_micros(50) {
-                // Loop ran too fast - pace ourselves to avoid CPU thrashing
-                std::thread::yield_now();
+            // Minimal sleep to prevent CPU spinning while letting congestion control work
+            if written < data.len() {
+                // Still have data to send - minimal delay
+                if packets_sent == 0 && acks_received == 0 {
+                    // Completely stalled - wait for network activity
+                    std::thread::sleep(Duration::from_micros(50));
+                } else {
+                    // Active transfer - just yield
+                    std::thread::yield_now();
+                }
             }
             
             // Timeout check
