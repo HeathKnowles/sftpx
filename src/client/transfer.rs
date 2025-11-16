@@ -929,8 +929,8 @@ impl Transfer {
             }
         }
         
-        // Save to disk in .sftpx_resume directory
-        let resume_dir = std::path::PathBuf::from(".sftpx_resume");
+        // Save to disk in sftpx_resume directory (cross-platform)
+        let resume_dir = std::path::PathBuf::from("sftpx_resume");
         if !resume_dir.exists() {
             std::fs::create_dir_all(&resume_dir)?;
         }
@@ -945,7 +945,7 @@ impl Transfer {
     
     /// Load bitmap from disk for resume capability
     fn load_resume_bitmap(&self, session_id: &str) -> Result<ChunkBitmap> {
-        let resume_dir = std::path::PathBuf::from(".sftpx_resume");
+        let resume_dir = std::path::PathBuf::from("sftpx_resume");
         let bitmap_path = resume_dir.join(format!("{}.bitmap", session_id));
         
         if bitmap_path.exists() {

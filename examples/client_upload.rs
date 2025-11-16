@@ -25,7 +25,7 @@ fn get_session_id_for_file(file_path: &Path) -> String {
 }
 
 fn check_for_resume(session_id: &str) -> Option<u32> {
-    let resume_dir = PathBuf::from(".sftpx_resume");
+    let resume_dir = PathBuf::from("sftpx_resume");
     let bitmap_path = resume_dir.join(format!("{}.bitmap", session_id));
     
     if bitmap_path.exists() {
