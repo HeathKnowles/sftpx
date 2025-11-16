@@ -1028,7 +1028,7 @@ impl Transfer {
         let mut received_response = false;
         let mut existing_hashes = vec![];
         let mut idle_iterations = 0;
-        const MAX_IDLE: usize = 1000;  // 1000 * 10ms = 10 seconds for hash check
+        const MAX_IDLE: usize = 200;  // 200 * 10ms = 2 seconds - faster timeout for high-speed networks
         
         debug!("Client: waiting for hash check response on stream {}...", STREAM_HASH_CHECK);
         
@@ -1169,10 +1169,6 @@ impl Transfer {
         // Process chunks in parallel pipeline
         let mut chunk_iter = chunker.process_chunks()?;
         
-        // Batch chunks for more efficient sending (reduce per-chunk overhead)
-        let mut chunk_batch = Vec::new();
-        const BATCH_SIZE: usize = 4; // Send 4 chunks before flushing
-        
         while let Some(chunk_result) = chunk_iter.next() {
             let processed_chunk = chunk_result?;
             let chunk_id = processed_chunk.chunk_id;
@@ -1202,43 +1198,34 @@ impl Transfer {
                 continue;
             }
             
-            // Add to batch
-            chunk_batch.push(processed_chunk);
+            // Combine length prefix and chunk data into single send
+            let len_bytes = (processed_chunk.packet.len() as u32).to_be_bytes();
+            let mut combined_data = Vec::with_capacity(4 + processed_chunk.packet.len());
+            combined_data.extend_from_slice(&len_bytes);
+            combined_data.extend_from_slice(&processed_chunk.packet);
             
-            // Send batch when full or on last chunk
-            if chunk_batch.len() >= BATCH_SIZE || is_last {
-                for chunk in chunk_batch.drain(..) {
-                    // Combine length prefix and chunk data into single send
-                    let len_bytes = (chunk.packet.len() as u32).to_be_bytes();
-                    let mut combined_data = Vec::with_capacity(4 + chunk.packet.len());
-                    combined_data.extend_from_slice(&len_bytes);
-                    combined_data.extend_from_slice(&chunk.packet);
-                    
-                    let chunk_is_last = chunk.end_of_file;
-                    self.send_data_with_flow_control(
-                        connection, socket, buf, out, local_addr,
-                        STREAM_DATA, &combined_data, chunk_is_last
-                    )?;
-                    
-                    bytes_sent += chunk.packet.len() as u64;
-                    chunk_count += 1;
-                    
-                    // Mark chunk as sent in bitmap for resume capability
-                    let is_eof_chunk = chunk_count == total_chunks;
-                    sent_bitmap.mark_received((chunk_count - 1) as u32, is_eof_chunk);
+            self.send_data_with_flow_control(
+                connection, socket, buf, out, local_addr,
+                STREAM_DATA, &combined_data, is_last
+            )?;
+            
+            bytes_sent += processed_chunk.packet.len() as u64;
+            chunk_count += 1;
+            
+            // Mark chunk as sent in bitmap for resume capability
+            let is_eof_chunk = chunk_count == total_chunks;
+            sent_bitmap.mark_received((chunk_count - 1) as u32, is_eof_chunk);
+            
+            // Periodically save bitmap for resume (every 100 chunks)
+            if chunk_count % 100 == 0 || is_eof_chunk {
+                if let Err(e) = self.save_resume_bitmap(&manifest.session_id, &sent_bitmap) {
+                    warn!("Client: failed to save resume bitmap: {}", e);
                 }
-                
-                // Periodically save bitmap for resume (every 100 chunks)
-                if chunk_count % 100 == 0 || is_last {
-                    if let Err(e) = self.save_resume_bitmap(&manifest.session_id, &sent_bitmap) {
-                        warn!("Client: failed to save resume bitmap: {}", e);
-                    }
-                }
-                
-                if chunk_count % 50 == 0 || is_last {
-                    info!("Client: sent chunk {}/{} ({:.1}%)", 
-                        chunk_count, total_chunks, (chunk_count as f64 / total_chunks as f64) * 100.0);
-                }
+            }
+            
+            if chunk_count % 50 == 0 || is_last {
+                info!("Client: sent chunk {}/{} ({:.1}%)", 
+                    chunk_count, total_chunks, (chunk_count as f64 / total_chunks as f64) * 100.0);
             }
         }
         
@@ -1313,48 +1300,39 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_iterations = 1_000_000;  // Much higher limit - 1 million iterations
+        let max_iterations = 1_000_000;
         let mut iterations = 0;
         let mut consecutive_no_progress = 0;
         let start_time = std::time::Instant::now();
-        let max_duration = Duration::from_secs(120); // 2 minute absolute timeout
+        let max_duration = Duration::from_secs(120);
         
         while written < data.len() {
             let before_written = written;
             
-            // Try to write to stream - write as much as possible
+            // Try to write to stream
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
                 Ok(w) if w > 0 => {
                     written += w;
                     consecutive_no_progress = 0;
                 }
-                Ok(_) => {
-                    // 0 bytes written, flow control blocked
-                }
-                Err(ref e) if format!("{:?}", e).contains("Done") => {
-                    // Stream not ready
-                }
+                Ok(_) => {}
+                Err(ref e) if format!("{:?}", e).contains("Done") => {}
                 Err(e) => return Err(e),
             }
             
-            // Flush packets - send everything available aggressively
+            // Flush packets
             let mut sent_packet = false;
-            loop {
-                match connection.send(out) {
-                    Ok((len, send_info)) => {
-                        match socket.send_to(&out[..len], send_info.to) {
-                            Ok(_) => { sent_packet = true; },
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(e) => return Err(Error::from(e)),
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((len, send_info)) = connection.send(out) {
+                match socket.send_to(&out[..len], send_info.to) {
+                    Ok(_) => { sent_packet = true; },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(Error::from(e)),
                 }
             }
             
-            // Try to receive ACKs - non-blocking, multiple packets
+            // Receive ACKs - read multiple packets per iteration for better throughput
             let mut received_ack = false;
-            for _ in 0..10 {  // Try to read up to 10 packets per iteration
+            for _ in 0..20 {  // Read up to 20 packets for high-speed networks
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
@@ -1367,24 +1345,21 @@ impl Transfer {
                 }
             }
             
-            // Check if we made any progress (sending data OR network activity)
+            // Progress tracking
             if written == before_written {
                 consecutive_no_progress += 1;
                 
-                // If stuck with no network activity, yield to prevent CPU spinning
-                if consecutive_no_progress > 1000 && !sent_packet && !received_ack {
-                    std::thread::sleep(Duration::from_micros(50));
-                }
-                
-                // Reset counter if there's any network activity even without send progress
-                if sent_packet || received_ack {
+                // Yield only when truly stuck with no network activity
+                if consecutive_no_progress > 2000 && !sent_packet && !received_ack {
+                    std::thread::sleep(Duration::from_micros(1));  // Minimal sleep
+                    consecutive_no_progress = 0;
+                } else if sent_packet || received_ack {
                     consecutive_no_progress = 0;
                 }
             }
             
             iterations += 1;
             
-            // Check absolute timeout
             if start_time.elapsed() > max_duration {
                 return Err(Error::Protocol(format!(
                     "Flow control timeout: sent {}/{} bytes ({:.1}%) after {:.1}s",
