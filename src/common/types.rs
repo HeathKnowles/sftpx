@@ -64,7 +64,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const PROTOCOL_VERSION: &str = "sftpx/0.1";
-pub const MAX_STREAM_WINDOW: u64 = 10 * 1024 * 1024; // 10MB
+pub const MAX_STREAM_WINDOW: u64 = 100 * 1024 * 1024; // 100MB - increased for faster transfers
 
 // Keepalive/Heartbeat constants
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30); // Send heartbeat every 30s

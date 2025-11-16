@@ -36,8 +36,8 @@ impl Default for ServerConfig {
             cert_path: "certs/cert.pem".to_string(),
             key_path: "certs/key.pem".to_string(),
             max_idle_timeout: 5000,
-            max_data: 100_000_000,
-            max_stream_data: 10485760,
+            max_data: 1_000_000_000,  // 1GB connection window
+            max_stream_data: 104_857_600,  // 100MB per stream
             max_streams: 100,
         }
     }
