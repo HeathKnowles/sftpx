@@ -19,11 +19,13 @@ pub enum SyncMode {
     SyncAll,
     /// Sync every N chunks (balanced)
     SyncEvery(u64),
+    /// Buffer everything in RAM, write once at end (fastest!)
+    BufferedInMemory,
 }
 
 impl Default for SyncMode {
     fn default() -> Self {
-        SyncMode::FlushOnly
+        SyncMode::BufferedInMemory  // Changed to in-memory buffering by default
     }
 }
 
@@ -51,10 +53,12 @@ pub struct FileReceiver {
     control_sender: Option<ControlMessageSender>,
     /// Enable automatic retransmission on corruption
     auto_retransmit: bool,
+    /// In-memory buffer for BufferedInMemory mode
+    memory_buffer: Option<Vec<u8>>,
 }
 
 impl FileReceiver {
-    /// Create a new file receiver with default sync mode (FlushOnly)
+    /// Create a new file receiver with default sync mode (BufferedInMemory)
     /// 
     /// # Arguments
     /// * `output_dir` - Directory to save the file to
@@ -87,10 +91,21 @@ impl FileReceiver {
             .create(true)
             .open(&part_file_path)?;
         
-        // Pre-allocate space if possible
-        if file_size > 0 {
-            part_file.set_len(file_size)?;
-        }
+        // Initialize memory buffer for BufferedInMemory mode
+        let memory_buffer = if matches!(sync_mode, SyncMode::BufferedInMemory) {
+            if file_size > 0 {
+                log::info!("Allocating {} MB in-memory buffer for fast reception", file_size / (1024 * 1024));
+                Some(vec![0u8; file_size as usize])
+            } else {
+                Some(Vec::new())
+            }
+        } else {
+            // Pre-allocate disk space for non-buffered modes
+            if file_size > 0 {
+                part_file.set_len(file_size)?;
+            }
+            None
+        };
         
         Ok(Self {
             part_file,
@@ -108,6 +123,7 @@ impl FileReceiver {
             missing_tracker: None,
             control_sender: None,
             auto_retransmit: false,
+            memory_buffer,
         })
     }
     
@@ -192,23 +208,44 @@ impl FileReceiver {
             return Ok(chunk);
         }
         
-        // Write chunk to file at correct offset
-        self.part_file.seek(SeekFrom::Start(chunk.byte_offset))?;
-        self.part_file.write_all(&chunk.data)?;
-        
-        // Sync based on configured mode
+        // Write chunk - either to memory buffer or disk
         match self.sync_mode {
-            SyncMode::FlushOnly => {
-                self.part_file.flush()?;
+            SyncMode::BufferedInMemory => {
+                // Write to in-memory buffer (super fast!)
+                if let Some(buffer) = &mut self.memory_buffer {
+                    let start = chunk.byte_offset as usize;
+                    let end = start + chunk.data.len();
+                    
+                    // Grow buffer if needed (for dynamic file sizes)
+                    if end > buffer.len() {
+                        buffer.resize(end, 0);
+                    }
+                    
+                    buffer[start..end].copy_from_slice(&chunk.data);
+                }
+                // No disk I/O at all!
             }
-            SyncMode::SyncAll => {
-                self.part_file.flush()?;
-                self.part_file.sync_all()?;
-            }
-            SyncMode::SyncEvery(n) => {
-                self.part_file.flush()?;
-                if (chunk.chunk_id + 1) % n == 0 {
-                    self.part_file.sync_all()?;
+            _ => {
+                // Write to disk for other modes
+                self.part_file.seek(SeekFrom::Start(chunk.byte_offset))?;
+                self.part_file.write_all(&chunk.data)?;
+                
+                // Sync based on configured mode
+                match self.sync_mode {
+                    SyncMode::FlushOnly => {
+                        self.part_file.flush()?;
+                    }
+                    SyncMode::SyncAll => {
+                        self.part_file.flush()?;
+                        self.part_file.sync_all()?;
+                    }
+                    SyncMode::SyncEvery(n) => {
+                        self.part_file.flush()?;
+                        if (chunk.chunk_id + 1) % n == 0 {
+                            self.part_file.sync_all()?;
+                        }
+                    }
+                    SyncMode::BufferedInMemory => unreachable!(),
                 }
             }
         }
@@ -412,14 +449,29 @@ impl FileReceiver {
             )));
         }
         
+        // If using in-memory buffer, write it to disk NOW (single write!)
+        if matches!(self.sync_mode, SyncMode::BufferedInMemory) {
+            if let Some(buffer) = &self.memory_buffer {
+                log::info!("Writing {} MB from memory to disk...", buffer.len() / (1024 * 1024));
+                let write_start = std::time::Instant::now();
+                
+                self.part_file.seek(SeekFrom::Start(0))?;
+                self.part_file.write_all(buffer)?;
+                self.part_file.flush()?;
+                self.part_file.sync_all()?;
+                
+                log::info!("Disk write completed in {:.2}s", write_start.elapsed().as_secs_f64());
+            }
+        } else {
+            // For other modes, just flush what's already on disk
+            self.part_file.flush()?;
+            self.part_file.sync_all()?;
+        }
+        
         // Verify file hash if expected hash is set
         if self.expected_file_hash.is_some() {
             self.verify_file_hash()?;
         }
-        
-        // Flush and sync
-        self.part_file.flush()?;
-        self.part_file.sync_all()?;
         
         // Close the file
         drop(std::mem::replace(
