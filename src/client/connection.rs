@@ -48,14 +48,14 @@ impl ClientConnection {
             .set_application_protos(&[PROTOCOL_VERSION.as_bytes()])
             .map_err(|e| Error::Quic(format!("Failed to set application protos: {:?}", e)))?;
         
-        // Configure transport parameters for high-speed transfers
+        // Configure transport parameters for high-speed parallel transfers
         quic_config.set_max_idle_timeout(IDLE_TIMEOUT.as_millis() as u64);
         quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        quic_config.set_initial_max_data(MAX_STREAM_WINDOW * 10);  // 1GB connection window
-        quic_config.set_initial_max_stream_data_bidi_local(MAX_STREAM_WINDOW);  // 100MB per stream
-        quic_config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_WINDOW);  // 100MB per stream
-        quic_config.set_initial_max_stream_data_uni(MAX_STREAM_WINDOW);  // 100MB per stream
+        quic_config.set_initial_max_data(MAX_STREAM_WINDOW * 10);  // 2.56GB connection window
+        quic_config.set_initial_max_stream_data_bidi_local(MAX_STREAM_WINDOW);  // 256MB per stream
+        quic_config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_WINDOW);  // 256MB per stream
+        quic_config.set_initial_max_stream_data_uni(MAX_STREAM_WINDOW);  // 256MB per stream
         quic_config.set_initial_max_streams_bidi(100);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(false);

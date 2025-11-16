@@ -649,11 +649,11 @@ impl Transfer {
             .as_secs();
         let session_id = format!("upload_{}", timestamp);
         
-        // Build manifest
+        // Build manifest using parallel hash computation for better performance
         let manifest = ManifestBuilder::new(session_id.clone())
             .file_path(file_path)
             .chunk_size(self.config.chunk_size as u32)
-            .build()?;
+            .build_parallel()?;
         
         info!("Client: sending manifest ({} chunks, {} bytes total)", 
             manifest.total_chunks, manifest.file_size);
@@ -1028,7 +1028,7 @@ impl Transfer {
         let mut received_response = false;
         let mut existing_hashes = vec![];
         let mut idle_iterations = 0;
-        const MAX_IDLE: usize = 500;  // 500 * 10ms = 5 seconds to match server
+        const MAX_IDLE: usize = 1000;  // 1000 * 10ms = 10 seconds for hash check
         
         debug!("Client: waiting for hash check response on stream {}...", STREAM_HASH_CHECK);
         
@@ -1107,7 +1107,7 @@ impl Transfer {
         existing_hashes: &[Vec<u8>],
         skip_chunks: &std::collections::HashSet<u64>,
     ) -> Result<u64> {
-        use crate::chunking::FileChunker;
+        use crate::chunking::ParallelChunker;
         use std::collections::HashSet;
         
         info!("Client: starting file chunk upload...");
@@ -1120,11 +1120,14 @@ impl Transfer {
             .map(|v| v.as_slice())
             .collect();
         
-        let mut chunker = FileChunker::with_compression(
-            file_path, 
+        // Create parallel chunker for high-performance processing
+        let chunker = ParallelChunker::new(
+            file_path,
             Some(self.config.chunk_size),
-            self.config.compression
+            self.config.compression,
+            None, // Auto-detect CPU count
         )?;
+        
         let total_chunks = chunker.total_chunks();
         let mut bytes_sent = 0u64;
         let mut chunk_count = 0u64;
@@ -1151,11 +1154,16 @@ impl Transfer {
             }
         }
         
-        while let Some(chunk_packet) = chunker.next_chunk()? {
-            let is_last = chunk_count == total_chunks - 1;
+        // Process chunks in parallel pipeline
+        let mut chunk_iter = chunker.process_chunks()?;
+        
+        while let Some(chunk_result) = chunk_iter.next() {
+            let processed_chunk = chunk_result?;
+            let chunk_id = processed_chunk.chunk_id;
+            let is_last = processed_chunk.end_of_file;
             
             // Check if this chunk should be skipped (resume mode)
-            if skip_chunks.contains(&chunk_count) {
+            if skip_chunks.contains(&chunk_id) {
                 chunks_skipped += 1;
                 chunk_count += 1;
                 
@@ -1166,8 +1174,7 @@ impl Transfer {
             }
             
             // Check if this chunk's hash exists on server (dedup)
-            let chunk_hash = &manifest.chunk_hashes[chunk_count as usize];
-            let should_skip = existing_set.contains(chunk_hash.as_slice());
+            let should_skip = existing_set.contains(processed_chunk.hash.as_slice());
             
             if should_skip {
                 chunks_skipped += 1;
@@ -1180,17 +1187,17 @@ impl Transfer {
             }
             
             // Combine length prefix and chunk data into single send (avoid double flow control)
-            let len_bytes = (chunk_packet.len() as u32).to_be_bytes();
-            let mut combined_data = Vec::with_capacity(4 + chunk_packet.len());
+            let len_bytes = (processed_chunk.packet.len() as u32).to_be_bytes();
+            let mut combined_data = Vec::with_capacity(4 + processed_chunk.packet.len());
             combined_data.extend_from_slice(&len_bytes);
-            combined_data.extend_from_slice(&chunk_packet);
+            combined_data.extend_from_slice(&processed_chunk.packet);
             
             self.send_data_with_flow_control(
                 connection, socket, buf, out, local_addr,
                 STREAM_DATA, &combined_data, is_last
             )?;
             
-            bytes_sent += chunk_packet.len() as u64;
+            bytes_sent += processed_chunk.packet.len() as u64;
             chunk_count += 1;
             
             // Mark chunk as sent in bitmap for resume capability
@@ -1281,14 +1288,18 @@ impl Transfer {
         fin: bool,
     ) -> Result<()> {
         let mut written = 0;
-        let max_iterations = 100000;  // Higher limit for truly non-blocking operation
+        let max_iterations = 100000;  // Higher limit for non-blocking operation
         let mut iterations = 0;
+        let mut consecutive_no_progress = 0;
         
         while written < data.len() {
+            let before_written = written;
+            
             // Try to write to stream - write as much as possible
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
                 Ok(w) if w > 0 => {
                     written += w;
+                    consecutive_no_progress = 0;
                 }
                 Ok(_) => {
                     // 0 bytes written, flow control blocked
@@ -1308,15 +1319,27 @@ impl Transfer {
                 }
             }
             
-            // Try to receive ACKs - truly non-blocking, no sleep
+            // Try to receive ACKs - non-blocking
             match socket.recv_from(buf) {
                 Ok((len, from)) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = connection.recv(&mut buf[..len], recv_info);
+                    consecutive_no_progress = 0;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => return Err(Error::from(e)),
+            }
+            
+            // Check if we made any progress
+            if written == before_written {
+                consecutive_no_progress += 1;
+                
+                // If stuck for a while, yield to prevent CPU spinning
+                if consecutive_no_progress > 100 {
+                    std::thread::sleep(Duration::from_micros(10));
+                    consecutive_no_progress = 0;
+                }
             }
             
             iterations += 1;

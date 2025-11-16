@@ -36,6 +36,11 @@ indicatif = "0.17"
 lz4 = "1.28"
 zstd = "0.13"
 
+# Parallelism
+rayon = "1.10"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+
 # Utilities
 hex = "0.4"
 

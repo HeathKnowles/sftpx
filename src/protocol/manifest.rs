@@ -57,12 +57,21 @@ impl ManifestBuilder {
     /// * `Ok(Manifest)` - Successfully built manifest
     /// * `Err(Error)` - If file cannot be read or processed
     pub fn build(self) -> Result<Manifest> {
+        self.build_internal(false)
+    }
+    
+    /// Build the manifest using parallel hash computation for better performance
+    pub fn build_parallel(self) -> Result<Manifest> {
+        self.build_internal(true)
+    }
+    
+    fn build_internal(self, use_parallel: bool) -> Result<Manifest> {
         let file_path = self.file_path.ok_or_else(|| {
             Error::Protocol("File path not set".to_string())
         })?;
 
         // Open and get file metadata
-        let mut file = File::open(&file_path)?;
+        let file = File::open(&file_path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len();
 
@@ -80,40 +89,17 @@ impl ManifestBuilder {
         // Calculate total chunks
         let total_chunks = (file_size + self.chunk_size as u64 - 1) / self.chunk_size as u64;
 
-        // Read file and compute hashes
-        let mut chunk_hashes = Vec::with_capacity(total_chunks as usize);
-        let mut file_hasher = blake3::Hasher::new();
-        let mut buffer = vec![0u8; self.chunk_size as usize];
-        let mut bytes_read_total = 0u64;
-
-        file.seek(SeekFrom::Start(0))?;
-
-        // Process each chunk
-        for _ in 0..total_chunks {
-            let remaining = file_size - bytes_read_total;
-            let to_read = std::cmp::min(remaining, self.chunk_size as u64) as usize;
-
-            // Read chunk
-            let bytes_read = file.read(&mut buffer[..to_read])?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            let chunk_data = &buffer[..bytes_read];
-
-            // Compute chunk hash
-            let chunk_hash = ChunkHasher::hash(chunk_data);
-            chunk_hashes.push(chunk_hash);
-
-            // Update file hasher
-            file_hasher.update(chunk_data);
-
-            bytes_read_total += bytes_read as u64;
-        }
-
-        // Finalize file hash
-        let file_hash = file_hasher.finalize();
-        let file_hash_bytes = file_hash.as_bytes().to_vec();
+        // Compute chunk hashes - use parallel version if requested and file is large enough
+        let chunk_hashes = if use_parallel && total_chunks > 4 {
+            use crate::chunking::compute_chunk_hashes_parallel;
+            compute_chunk_hashes_parallel(&file_path, self.chunk_size as usize)?
+        } else {
+            // Sequential version for small files
+            Self::compute_hashes_sequential(&file_path, file_size, total_chunks, self.chunk_size)?
+        };
+        
+        // Compute file hash (always sequential since we need to read entire file)
+        let file_hash_bytes = Self::compute_file_hash(&file_path, file_size, self.chunk_size)?;
 
         // Create manifest
         let manifest = Manifest {
@@ -133,6 +119,72 @@ impl ManifestBuilder {
         };
 
         Ok(manifest)
+    }
+    
+    /// Compute chunk hashes sequentially (for small files or fallback)
+    fn compute_hashes_sequential(
+        file_path: &Path,
+        file_size: u64,
+        total_chunks: u64,
+        chunk_size: u32,
+    ) -> Result<Vec<Vec<u8>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        use crate::chunking::hasher::ChunkHasher;
+        
+        let mut file = File::open(file_path)?;
+        let mut chunk_hashes = Vec::with_capacity(total_chunks as usize);
+        let mut buffer = vec![0u8; chunk_size as usize];
+        let mut bytes_read_total = 0u64;
+
+        file.seek(SeekFrom::Start(0))?;
+
+        // Process each chunk
+        for _ in 0..total_chunks {
+            let remaining = file_size - bytes_read_total;
+            let to_read = std::cmp::min(remaining, chunk_size as u64) as usize;
+
+            // Read chunk
+            let bytes_read = file.read(&mut buffer[..to_read])?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk_data = &buffer[..bytes_read];
+
+            // Compute chunk hash
+            let chunk_hash = ChunkHasher::hash(chunk_data);
+            chunk_hashes.push(chunk_hash);
+
+            bytes_read_total += bytes_read as u64;
+        }
+        
+        Ok(chunk_hashes)
+    }
+    
+    /// Compute file hash
+    fn compute_file_hash(file_path: &Path, file_size: u64, chunk_size: u32) -> Result<Vec<u8>> {
+        use std::io::Read;
+        
+        let mut file = File::open(file_path)?;
+        let mut file_hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; chunk_size as usize];
+        let mut bytes_read_total = 0u64;
+
+        while bytes_read_total < file_size {
+            let remaining = file_size - bytes_read_total;
+            let to_read = std::cmp::min(remaining, chunk_size as u64) as usize;
+            
+            let bytes_read = file.read(&mut buffer[..to_read])?;
+            if bytes_read == 0 {
+                break;
+            }
+            
+            file_hasher.update(&buffer[..bytes_read]);
+            bytes_read_total += bytes_read as u64;
+        }
+        
+        let file_hash = file_hasher.finalize();
+        Ok(file_hash.as_bytes().to_vec())
     }
 
     /// Build manifest from an already-chunked file with provided hashes

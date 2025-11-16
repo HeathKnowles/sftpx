@@ -57,14 +57,14 @@ pub enum TransferState {
 }
 
 // Constants
-pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024; // 1MB
+pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB - increased for better performance
 pub const MAX_CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
 pub const MIN_CHUNK_SIZE: usize = 64 * 1024; // 64KB
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const PROTOCOL_VERSION: &str = "sftpx/0.1";
-pub const MAX_STREAM_WINDOW: u64 = 100 * 1024 * 1024; // 100MB - increased for faster transfers
+pub const MAX_STREAM_WINDOW: u64 = 256 * 1024 * 1024; // 256MB - increased for high-speed parallel transfers
 
 // Keepalive/Heartbeat constants
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30); // Send heartbeat every 30s
