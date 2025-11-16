@@ -1361,10 +1361,13 @@ impl Transfer {
             // Step 2: Push data into stream (ONE attempt only)
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len()) {
                 Ok(w) => written += w,
-                Err(e) if e.to_string().contains("Done") => {
-                    // Stream not writable, continue to send/poll
+                Err(e) => {
+                    // Stream not writable (Done) or buffer full - continue to send/poll
+                    let err_str = e.to_string();
+                    if !err_str.contains("Done") && !err_str.contains("buffer") {
+                        return Err(e);
+                    }
                 }
-                Err(e) => return Err(e),
             }
             
             // Step 3: Send ALL quiche packets until Done/WouldBlock
@@ -1377,8 +1380,7 @@ impl Transfer {
                             Err(e) => return Err(Error::from(e)),
                         }
                     }
-                    Err(e) if e.to_string().contains("Done") => break,
-                    Err(e) => return Err(e),
+                    Err(_) => break, // Done or no data to send - this is normal
                 }
             }
             
