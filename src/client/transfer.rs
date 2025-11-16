@@ -1329,54 +1329,59 @@ impl Transfer {
     ) -> Result<()> {
         let mut written = 0;
         let start_time = std::time::Instant::now();
-        let max_duration = Duration::from_secs(300);  // 5 minutes timeout
+        let max_duration = Duration::from_secs(300);
         
-        // Set socket to non-blocking for efficient I/O
         socket.set_nonblocking(true).ok();
         
+        let mut no_progress_count = 0;
+        
         while written < data.len() {
-            // Try to write as much as possible to the stream
+            let prev_written = written;
+            
+            // Try to write to stream
             match connection.stream_send(stream_id, &data[written..], fin && written >= data.len() - 1) {
                 Ok(w) if w > 0 => {
                     written += w;
+                    no_progress_count = 0;
                 }
                 Ok(_) => {}
                 Err(ref e) if format!("{:?}", e).contains("Done") => {}
                 Err(e) => return Err(e),
             }
             
-            // Flush all pending packets aggressively
-            loop {
-                match connection.send(out) {
-                    Ok((len, send_info)) => {
-                        match socket.send_to(&out[..len], send_info.to) {
-                            Ok(_) => {},
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(e) => return Err(Error::from(e)),
-                        }
-                    }
-                    Err(_) => break,
+            // Flush all packets
+            while let Ok((len, send_info)) = connection.send(out) {
+                match socket.send_to(&out[..len], send_info.to) {
+                    Ok(_) => { no_progress_count = 0; },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(Error::from(e)),
                 }
             }
             
-            // Receive ACKs - drain all available
-            loop {
+            // Receive ACKs
+            for _ in 0..5 {
                 match socket.recv_from(buf) {
                     Ok((len, from)) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
                         let _ = connection.recv(&mut buf[..len], recv_info);
+                        no_progress_count = 0;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
             }
             
-            // If we've written everything, we're done - don't wait around!
-            if written >= data.len() {
-                break;
+            // If no progress, yield briefly
+            if written == prev_written {
+                no_progress_count += 1;
+                if no_progress_count > 50 {
+                    std::thread::sleep(Duration::from_micros(100));
+                    no_progress_count = 0;
+                } else if no_progress_count > 10 {
+                    std::thread::yield_now();
+                }
             }
             
-            // Timeout check
             if start_time.elapsed() > max_duration {
                 return Err(Error::Protocol(format!(
                     "Flow control timeout: sent {}/{} bytes ({:.1}%) after {:.1}s",
