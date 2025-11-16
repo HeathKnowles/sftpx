@@ -116,9 +116,16 @@ impl Server {
             println!("Server: sent handshake response");
 
             // Handle the connection session (this will complete handshake and handle data)
+            // If migration is detected during session, this will close and we'll accept a new connection
             match self.handle_session(&mut server_conn, &mut buf, &mut out) {
                 Ok(_) => println!("Server: session completed successfully"),
-                Err(e) => eprintln!("Server: session error: {:?}", e),
+                Err(e) => {
+                    if server_conn.migration_detected() {
+                        println!("Server: migration detected - closing old connection and waiting for new one");
+                    } else {
+                        eprintln!("Server: session error: {:?}", e);
+                    }
+                }
             }
 
             println!("Server: connection closed, ready for next connection\n");

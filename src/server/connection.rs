@@ -12,6 +12,7 @@ pub struct ServerConnection {
     last_activity: Instant,
     last_heartbeat: Instant,
     migration_count: usize,
+    migration_detected: bool,
 }
 
 impl ServerConnection {
@@ -30,6 +31,7 @@ impl ServerConnection {
             last_activity: Instant::now(),
             last_heartbeat: Instant::now(),
             migration_count: 0,
+            migration_detected: false,
         })
     }
 
@@ -40,11 +42,12 @@ impl ServerConnection {
         from: SocketAddr,
         to: SocketAddr,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        // Detect peer address migration
+        // Detect peer address migration - this means client restarted
         if from != self.peer_addr && self.conn.is_established() {
-            println!("Server: Peer migrated from {} to {}", self.peer_addr, from);
+            println!("Server: Peer migrated from {} to {} - treating as new connection", self.peer_addr, from);
             self.peer_addr = from;
             self.migration_count += 1;
+            self.migration_detected = true;
         }
         
         let recv_info = RecvInfo { from, to };
@@ -58,6 +61,16 @@ impl ServerConnection {
                 Err(Box::new(e))
             }
         }
+    }
+    
+    /// Check if peer migration was detected
+    pub fn migration_detected(&self) -> bool {
+        self.migration_detected
+    }
+    
+    /// Clear migration flag
+    pub fn clear_migration_flag(&mut self) {
+        self.migration_detected = false;
     }
 
     /// Send packets to the peer

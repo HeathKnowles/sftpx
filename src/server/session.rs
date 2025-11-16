@@ -113,7 +113,13 @@ impl<'a> ServerSession<'a> {
                 println!("Server: recv {} bytes from {}", len, from);
                 let to = socket.local_addr()?;
                 match self.connection.process_packet(&mut buf[..len], from, to) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // Check if migration was detected - abort session to accept new connection
+                        if self.connection.migration_detected() {
+                            println!("Server: migration detected - aborting session");
+                            return Err("Peer migration detected - restarting".into());
+                        }
+                    }
                     Err(e) => eprintln!("Server: packet processing error: {:?}", e),
                 }
             }
